@@ -47,7 +47,8 @@ The detailed guides are currently in Chinese:
 
 - [Usage guide](docs/usage.md): running the tools, recording, exporting, and troubleshooting.
 - [Development guide](docs/development.md): builds, tests, the state machine, memory ownership, and the C++ interface contract.
-- [Algorithm design](docs/matching-design.md): enrollment, matching, templates, CNN/BRISK candidate designs, and acceptance criteria; algorithm selection remains open and depends on sensor data evaluation.
+- [Imaging study](docs/imaging-characteristics.md): measured intensity, texture scale, partial coverage, and refresh behavior, illustrated with synthetic images containing no real fingerprints.
+- [Algorithm design](docs/matching-design.md): a sensor-specific design covering finger variability, bounded rotation tolerance, local CNN and attention models, multiview enrollment, and production acceptance requirements for Pocket 4.
 - [Protocol and data format](docs/protocol.md): commands, raw frames, sample evidence, and unresolved questions.
 - [Device capabilities](docs/device-capability.md): hardware observations, evidence scope, and unverified capabilities.
 - [Windows porting reference](docs/windows-reference.md): behavior differences, commands, and evidence checked against device models and runtime branches.

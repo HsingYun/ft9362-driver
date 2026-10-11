@@ -45,7 +45,8 @@ python tools/capture.py --preview /path/to/frame.bin
 
 - [使用指南](docs/usage.md)：运行、录制、导出与故障排查。
 - [开发指南](docs/development.md)：构建测试、状态机、内存所有权与 C++ 接口契约。
-- [算法设计](docs/matching-design.md)：录入、匹配、模板、CNN／BRISK 候选设计与验收；开放算法选型，最终方案由设备样本评估确定。
+- [成像实验](docs/imaging-characteristics.md)：实测灰度、纹理尺度、局部覆盖和刷新行为，配合不含真实指纹的模拟图。
+- [算法设计](docs/matching-design.md)：结合窄幅成像、手指差异和有限旋转容忍的整体设计，明确局部 CNN、attention、多视图模板及 Pocket 4 上线验收要求。
 - [协议与数据格式](docs/protocol.md)：命令、原始帧、样本证据及未知项。
 - [设备能力](docs/device-capability.md)：本机实测结论、证据范围和待验证能力。
 - [Windows 移植参考](docs/windows-reference.md)：按型号与分支核对的行为差异、命令和移植依据。
