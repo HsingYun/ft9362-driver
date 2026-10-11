@@ -10,7 +10,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from gui import FPrint, GLib, Gtk, PreviewWindow
@@ -108,6 +108,41 @@ class PreviewTest(unittest.TestCase):
         self.assertIsNotNone(w.recording)
         self.assertTrue(w.next_id)
         self.assertIn("冷却", w.status.get_text())
+
+    def test_device_tests_wait_for_preview_close_and_block_restart(self):
+        w = self.window
+        w.running = True
+        w.pending = True
+        w.cancellable = Mock()
+        w.device = Mock()
+        w.device.is_open.return_value = True
+        w.recording = Recording(self.directory, name="测试手指")
+        with patch("device_test_gui.DeviceTestWindow") as factory:
+            w.open_tests()
+            w.cancellable.cancel.assert_called_once()
+            self.assertIsNone(w.recording)
+            factory.assert_not_called()
+            w.start()
+            self.assertFalse(w.running)
+            w.pending = False  # Capture cancellation callback has completed.
+            w.release()
+            factory.assert_not_called()
+            w.closed(w.device, None)
+            factory.assert_called_once()
+            self.assertFalse(w.start_button.get_sensitive())
+            w.tests_closed()
+            self.assertTrue(w.start_button.get_sensitive())
+
+    def test_failed_preview_close_does_not_open_second_usb_owner(self):
+        w = self.window
+        w.test_requested = True
+        w.device = Mock()
+        w.device.close_finish.side_effect = GLib.Error("test close failure")
+        with patch("device_test_gui.DeviceTestWindow") as factory:
+            w.closed(w.device, None)
+            factory.assert_not_called()
+        self.assertFalse(w.test_requested)
+        self.assertIn("关闭设备失败", w.status.get_text())
 
 
 if __name__ == "__main__":

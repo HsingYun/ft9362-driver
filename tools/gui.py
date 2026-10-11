@@ -38,6 +38,8 @@ class PreviewWindow(Gtk.Window):
         self.recording = None
         self.dirty = False
         self.last_stats_log = 0
+        self.test_requested = False
+        self.test_window = None
         self.set_default_size(720, 650)
         self.set_border_width(16)
         self.connect("delete-event", self.on_delete)
@@ -70,6 +72,9 @@ class PreviewWindow(Gtk.Window):
         self.invert.connect("toggled", self.render)
         options = Gtk.Box(spacing=12)
         options.pack_start(self.invert, False, False, 0)
+        self.test_button = Gtk.Button(label="设备测试…")
+        self.test_button.connect("clicked", self.open_tests)
+        options.pack_start(self.test_button, False, False, 0)
         box.pack_start(options, False, False, 0)
 
         self.picture = Gtk.Image()
@@ -101,14 +106,16 @@ class PreviewWindow(Gtk.Window):
         self.refresh_id = GLib.timeout_add(100, self.refresh)
 
     def update_buttons(self):
-        self.start_button.set_sensitive(not self.running and not self.pending and not self.args.preview)
+        testing = self.test_requested or self.test_window is not None
+        self.start_button.set_sensitive(not self.running and not self.pending and not self.args.preview and not testing)
+        self.test_button.set_sensitive(not testing and not self.closing and not self.args.preview)
         self.stop_button.set_sensitive(self.running)
         self.save_button.set_sensitive(self.frame is not None)
         self.record_button.set_sensitive(self.running and self.recording is None)
         self.end_record_button.set_sensitive(self.recording is not None)
 
     def start(self, *_):
-        if self.pending or self.running:
+        if self.pending or self.running or self.test_requested or self.test_window is not None or self.closing:
             return
         try:
             if self.device is None:
@@ -316,6 +323,8 @@ class PreviewWindow(Gtk.Window):
             self.device.close(None, self.closed, None)
         elif self.closing:
             Gtk.main_quit()
+        elif self.test_requested:
+            self.show_tests()
 
     def closed(self, device, result, _=None):
         self.pending = False
@@ -323,7 +332,36 @@ class PreviewWindow(Gtk.Window):
             device.close_finish(result)
         except GLib.Error as error:
             self.status.set_text(f"关闭设备失败：{error}")
+            self.test_requested = False
+            self.update_buttons()
+            if self.closing:
+                Gtk.main_quit()
+            return
         self.device = None
+        self.update_buttons()
+        if self.closing:
+            Gtk.main_quit()
+        elif self.test_requested:
+            self.show_tests()
+
+    def open_tests(self, *_):
+        if self.test_requested or self.test_window is not None or self.args.preview:
+            return
+        self.test_requested = True
+        self.stop()
+        if self.pending:
+            self.status.set_text("正在停止预览并释放设备，然后打开测试向导……")
+
+    def show_tests(self):
+        from device_test_gui import DeviceTestWindow
+        self.test_requested = False
+        self.test_window = DeviceTestWindow(parent=self, on_closed=self.tests_closed)
+        self.test_window.show_all()
+        self.update_buttons()
+
+    def tests_closed(self):
+        self.test_window = None
+        self.status.set_text("设备测试已关闭，点击“恢复预览”继续采集。")
         self.update_buttons()
         if self.closing:
             Gtk.main_quit()
@@ -334,6 +372,10 @@ class PreviewWindow(Gtk.Window):
             GLib.source_remove(self.refresh_id)
             self.refresh_id = 0
         self.hide()
+        if self.test_window is not None:
+            self.test_window.on_close()
+            return True
+        self.test_requested = False
         self.stop()
         return True
 

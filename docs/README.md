@@ -7,6 +7,7 @@
 | [算法设计](matching-design.md) | 无第三方库约束、录入与匹配、CNN／BRISK 与 attention 候选、开放选型与验收 |
 | [协议与数据格式](protocol.md) | 当前 Linux 通信、原始帧布局与样本证据 |
 | [Windows 移植参考](windows-reference.md) | Windows 静态分析、型号边界、能力差异与移植细节 |
+| [设备能力与实测对照](device-capability.md) | 统一测试结论、全部已知能力、Linux/Windows 差异、GUI 复现与验证边界 |
 
 使用与开发指南描述当前实现；算法设计描述正式认证目标，最终选型待设备样本评估；协议文档区分实测、静态分析与推断。Windows 参考保留详细证据和地址，供后续移植使用，不重复作为日常开发教程。
 
