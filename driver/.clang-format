@@ -1,0 +1,5 @@
+BasedOnStyle: Google
+ColumnLimit: 300
+InsertBraces: true
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortEnumsOnASingleLine: false

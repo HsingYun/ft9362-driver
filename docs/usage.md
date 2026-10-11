@@ -1,0 +1,94 @@
+# 使用指南
+
+## 环境与启动
+
+需要 Linux、支持 flakes 的 Nix，以及 USB `2808:0752` 设备。GUI 还需要桌面显示服务。所有命令从仓库根目录执行：
+
+```sh
+nix develop
+python tools/capture.py
+```
+
+[开发环境](../flake.nix) 提供定制 libfprint、Python、PyGObject 和 GTK 3。它不安装系统服务，也不修改系统认证配置。当前后端旁路匹配，仅用于研究采集。
+
+设备需对当前用户可读写，且未被其他采集程序或服务占用。构建产物附带 udev 规则；需要配置宿主权限时执行：
+
+```sh
+nix build
+sudo install -m 0644 result/lib/udev/rules.d/60-focaltech0752.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+```
+
+重新插拔设备后规则生效；内置设备可重启系统。规则使用 `uaccess` 为本地活动会话分配权限，另包含 `plugdev` 组设置。无桌面会话的访问权限需按宿主配置处理。
+
+## GUI
+
+默认启动后连续预览，未开启录制时不写文件。
+
+| 操作 | 行为 |
+| --- | --- |
+| 暂停 / 恢复预览 | 取消当前采集并关闭设备；恢复时重新打开，保留最后一帧供查看 |
+| 录制 | 新建命名手指数据库，或向已有手指数据库追加一个会话 |
+| 停止录制 | 提交并结束当前会话，继续预览 |
+| 保存当前帧 | 导出完整原始帧、预览 PNG；实时采集还导出序列化的 FpPrint |
+| 反色 | 仅改变显示和导出的预览 PNG |
+
+预览从偏移 4 读取小端 16 位数据，显示为 40 × 152 灰度图，使用 5–95% 分位对比度拉伸。窗口放大不改变 PNG 的原始尺寸。旧的偏移 6、半幅和 80 × 76 布局已移除；依据见[协议与数据格式](protocol.md)。
+
+等待手指不会自动结束录制。libfprint 报告过热时，工具等待两秒后重试，并保留录制会话。暂停预览或关闭窗口会结束录制；正常关闭会等待待处理操作完成。
+
+工具显示近期帧率、首末帧间平均帧率和距上一帧的时间。这些是主机接收速率，包含等待和传输时间，不是传感器额定帧率。
+
+## CLI 与离线预览
+
+统一入口为 [capture.py](../tools/capture.py)：
+
+```sh
+python tools/capture.py --cli --count 3 --timeout 30 --output build/captures
+python tools/capture.py --preview /path/to/frame.bin
+python tools/capture.py --help
+```
+
+| 参数 | 含义 |
+| --- | --- |
+| 无模式参数 | 打开 GUI，开始实时预览 |
+| `--cli` | 终端采集，默认一帧；每帧保存 `.bin` 和 `.fpprint` |
+| `--preview FILE` | 在 GUI 打开完整原始 `.bin`，不访问设备；可反色与导出 |
+| `--output DIR` | 输出目录，默认仓库根目录下的 `build/captures/` |
+| `--count N` | CLI 采集帧数，正整数，默认 1 |
+| `--timeout N` | CLI 每帧等待上限秒数，正整数，默认 30 |
+
+`--cli` 与 `--preview` 互斥。CLI 多帧采集会在帧间提示抬起手指并按 Enter；Ctrl+C 取消当前操作。持续录制由 GUI 提供，CLI 不创建录制数据库。离线预览仍需要 GTK 和 FPrint 类型库，纯数据处理测试不需要。
+
+## 保存格式
+
+| 文件 | 内容 |
+| --- | --- |
+| `frame-<UUID>.bin` | 完整的 12,166 字节 USB 原始帧，包含头尾 |
+| `frame-<UUID>.fpprint` | libfprint 序列化对象；当前包含同一原始帧，不是特征向量 |
+| `frame-<UUID>.png` | GUI 导出的 40 × 152 预览，8 位灰度值以 RGB PNG 存储；不包含协议头尾 |
+| `finger-<UUID>.sqlite3` | 一个命名手指的多次录制会话与完整帧 |
+
+SQLite 格式版本为 1：
+
+| 表 | 字段与含义 |
+| --- | --- |
+| `metadata` | `key`、`value`；含 `schema_version=1`、`finger_name`、`raw_format=FT9362-RAW-v1`、`frame_size=12166`、`timestamp_meaning` |
+| `sessions` | `id`、`started_utc`、`ended_utc`；每次新建或追加录制产生一个会话 |
+| `frames` | `id`、`session_id`、`received_unix_ns`、`received_monotonic_ns`、`raw`；`raw` 长度固定为 12,166 |
+
+时间戳记录主机收到完整 libfprint 帧的时刻。用同一会话的单调时钟计算帧间隔；不要跨重启或会话拼接。录制约每秒提交一次，正常结束时再次提交；异常退出可能丢失尚未提交的帧，并留下空的 `ended_utc`。
+
+新建输出目录权限为 `0700`，帧文件和数据库为 `0600`；已有目录权限不自动修改。原始数据未加密，默认输出及常见采集文件后缀已在 [.gitignore](../.gitignore) 中排除。将采集数据留在默认目录或仓库外；Git 忽略不等于加密，也不能阻止 `path:.` 形式的 Nix 输入收集它们。
+
+## 故障排查
+
+| 现象 | 检查顺序 |
+| --- | --- |
+| 没有找到设备 | 确认 USB ID；从本仓库的 `nix develop` 启动；工具要求恰好一台目标设备 |
+| 权限拒绝 / 接口忙 | 检查 USB 节点权限、udev 规则，以及其他程序或 fprintd 的占用 |
+| 提示旧驱动 | 当前驱动录入阶段数应为 1；退出旧 shell 后重新进入开发环境 |
+| FPrint 类型库不可用 | 使用开发环境中的 Python，检查是否覆盖了 `GI_TYPELIB_PATH` |
+| 无法连接桌面 | 在桌面终端启动，或使用 `--cli` |
+| 等待不出帧 | 完全抬起手指再放上；检查终端错误、冷却状态和设备初始化问题 |
+| USB 超时 / 帧长错误 | 保留错误及发生阶段，按[开发指南](development.md)定位；不要通过截断或补零掩盖问题 |

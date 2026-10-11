@@ -1,35 +1,52 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright (C) 2026 HsingYun
+# Modified 2026-10-11: raw capture build, independent C++ backend and regression tests.
 {
-  description = "FocalTech FT9362 (2808:0752) fingerprint driver for libfprint";
+  description = "FocalTech FT9362 raw capture development driver (no authentication)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system: let
+  outputs = { nixpkgs, flake-utils, ... }:
+    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (system: let
       pkgs = import nixpkgs { inherit system; };
 
       libfprint-focaltech0752 = pkgs.libfprint.overrideAttrs (oldAttrs: {
         pname = "libfprint-focaltech0752";
         __intentionallyOverridingVersion = true;
 
-        installCheckPhase = ''
-          runHook preInstallCheck
-          meson test --no-rebuild -C build --suite libfprint --exclude udev-hwdb || true
-          runHook postInstallCheck
+        postPatch = (oldAttrs.postPatch or "") + ''
+          cp ${./driver/focaltech-0752.c} libfprint/drivers/focaltech0752.c
+          cp -r ${./driver/algorithm} libfprint/drivers/algorithm
+          cp ${./tests/test-focaltech-raw.c} tests/test-focaltech-raw.c
+          cp ${./tests/test-ft9362-algorithm.c} tests/test-ft9362-algorithm.c
+          cat >> tests/meson.build <<'EOF'
+          raw_test = executable('test-focaltech-raw', 'test-focaltech-raw.c',
+            dependencies: [libfprint_private_dep, focaltech_algo_dep], c_args: common_cflags)
+          test('focaltech-raw', raw_test, suite: ['unit-tests'], env: envs)
+          algorithm_test = executable('test-ft9362-algorithm', 'test-ft9362-algorithm.c',
+            dependencies: focaltech_algo_dep)
+          test('ft9362-algorithm', algorithm_test, suite: ['unit-tests'])
+          EOF
+
+          substituteInPlace libfprint/meson.build \
+            --replace-fail "    'focaltech_moc' :" "    'focaltech0752' : ['drivers/focaltech0752.c'],
+              'focaltech_moc' :" \
+            --replace-fail "libfprint_drivers = static_library(" "subdir('drivers/algorithm')
+          libfprint_drivers = static_library(" \
+            --replace-fail "    c_args: drivers_cflags,
+              dependencies: deps," "    c_args: drivers_cflags,
+              dependencies: [deps, focaltech_algo_dep],"
+          substituteInPlace meson.build \
+            --replace-fail "    'focaltech_moc'," "    'focaltech_moc',
+              'focaltech0752',"
         '';
 
-        postPatch = (oldAttrs.postPatch or "") + ''
-          cp ${./shared/focaltech_nn_weights.h} libfprint/drivers/focaltech_nn_weights.h
-          cp ${./shared/focaltech_nn_infer.c} libfprint/drivers/focaltech_nn_infer.c
-          cp ${./shared/focaltech_nn_infer.h} libfprint/drivers/focaltech_nn_infer.h
-          cp ${./shared/focaltech_nn_match.c} libfprint/drivers/focaltech_nn_match.c
-          cp ${./shared/focaltech_nn_match.h} libfprint/drivers/focaltech_nn_match.h
-          cp ${./driver/focaltech-0752.c} libfprint/drivers/focaltech0752.c
-
-          sed -i "s/    'focaltech_moc' :/    'focaltech0752' :\n        [ 'drivers\/focaltech0752.c', 'drivers\/focaltech_nn_match.c', 'drivers\/focaltech_nn_infer.c' ],\n    'focaltech_moc' :/" libfprint/meson.build
-          sed -i "s/    'focaltech_moc',/    'focaltech_moc',\n    'focaltech0752',/" meson.build
+        # Include the added driver in the installed hwdb and its consistency check.
+        postBuild = (oldAttrs.postBuild or "") + ''
+          ninja sync-udev-hwdb
         '';
 
         postInstall = (oldAttrs.postInstall or "") + ''
@@ -39,50 +56,26 @@
           EOF
         '';
       });
-
-      fprintd-focaltech0752 = pkgs.fprintd.override {
-        libfprint = libfprint-focaltech0752;
-      };
     in {
       packages = {
         libfprint = libfprint-focaltech0752;
-        fprintd = fprintd-focaltech0752;
-        default = fprintd-focaltech0752;
+        default = libfprint-focaltech0752;
       };
 
       devShells.default = pkgs.mkShell {
+        nativeBuildInputs = [ pkgs.gobject-introspection ];
         buildInputs = with pkgs; [
           libfprint-focaltech0752
-          fprintd-focaltech0752
-          libusb1 glib pkg-config meson ninja gcc
+          libusb1 glib gtk3 librsvg pkg-config meson ninja gcc
+          (python3.withPackages (p: [ p.pygobject3 ]))
         ];
 
         shellHook = ''
-          echo "FocalTech FT9362 dev shell"
-          echo "  fprintd-enroll / fprintd-verify / fprintd-list"
+          export GI_TYPELIB_PATH="${libfprint-focaltech0752}/lib/girepository-1.0:${pkgs.lib.getLib pkgs.gusb}/lib/girepository-1.0:${pkgs.lib.getLib pkgs.json-glib}/lib/girepository-1.0:${pkgs.lib.getLib pkgs.glib}/lib/girepository-1.0''${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+          echo "FT9362 raw capture development shell - verification is bypassed"
+          echo "  python tools/capture.py       # live preview and recording"
+          echo "  python tools/capture.py --cli # single-frame terminal capture"
         '';
       };
-    }) // {
-      nixosModules.default = { config, lib, pkgs, ... }: let
-        cfg = config.services.fprintd-focaltech0752;
-      in {
-        options.services.fprintd-focaltech0752 = {
-          enable = lib.mkEnableOption "fprintd with FocalTech 0752 driver";
-        };
-
-        config = lib.mkIf cfg.enable {
-          services.fprintd.enable = lib.mkForce true;
-          services.fprintd.package = lib.mkForce self.packages.${pkgs.system}.fprintd;
-          services.udev.extraRules = ''
-            SUBSYSTEM=="usb", ATTRS{idVendor}=="2808", ATTRS{idProduct}=="0752", MODE="0664", GROUP="plugdev", TAG+="uaccess"
-          '';
-          users.groups.plugdev = {};
-        };
-      };
-
-      overlays.default = final: prev: {
-        libfprint-focaltech0752 = self.packages.${prev.system}.libfprint;
-        fprintd-focaltech0752 = self.packages.${prev.system}.fprintd;
-      };
-    };
+    });
 }

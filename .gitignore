@@ -1,4 +1,14 @@
+# Local captures and generated analysis outputs
 build/
+*.bin
+*.fpprint
+*.sqlite3
+*.sqlite3-*
+
+# Nix build links and compiler/Python caches
 result
+result-*
 *.o
 *.so
+__pycache__/
+*.py[cod]

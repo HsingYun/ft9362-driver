@@ -1,0 +1,5 @@
+*.dll binary
+*.exe binary
+*.cat binary
+*.png binary
+*.inf binary
