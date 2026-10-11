@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from device_capabilities import Experiment, INFO
@@ -121,6 +121,32 @@ class CapabilitiesTest(unittest.TestCase):
         self.assertEqual(len(ops), 5)
         self.assertEqual(ops[2]["outcome"], "control_request_stalled")
         self.assertEqual(ops[-1]["data_hex"], "00 00")
+
+    def test_fault_recovery_resets_before_bulk_and_reopens_same_port(self):
+        calls = []
+        e = Experiment({"operations": [], "connections": [{"device": {"sysfs": {"path": "/physical/port"}}}]})
+        reset = Mock(side_effect=lambda handle: calls.append("reset") or 0)
+        usb = Mock()
+        usb.lib.libusb_reset_device = reset
+        e.usb = usb
+        e.close = lambda: calls.append("close")
+        e.pause = lambda delay: calls.append("pause")
+        e.open = lambda expected_path: calls.append(("open", expected_path))
+        e.health = lambda label: calls.append("health")
+        e.recover_transport()
+        self.assertEqual(calls, ["reset", "close", "pause", ("open", "/physical/port"), "health"])
+        usb.transfer.assert_not_called()
+
+    def test_failed_reset_never_sends_health_queries(self):
+        e = Experiment({"operations": [], "connections": [{"device": {"sysfs": {"path": "/physical/port"}}}]})
+        e.usb = Mock()
+        e.usb.lib.libusb_reset_device.return_value = -1
+        e.usb.check.side_effect = ProbeError("reset failed")
+        e.health = Mock()
+        with self.assertRaises(ProbeError):
+            e.recover_transport()
+        e.health.assert_not_called()
+        self.assertFalse(e.transport_healthy)
 
 
 if __name__ == "__main__":

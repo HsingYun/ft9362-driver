@@ -147,6 +147,86 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(session.summary["steps"][1]["status"], "pending")
         self.assertTrue((session.directory / "report.md").exists())
 
+    def failed_session(self):
+        ex = Mock()
+        ex.queries.side_effect = ProbeError("bulk 81: LIBUSB_ERROR_PIPE (-9)")
+        session = TestSession(self.root, "no_finger", experiment_factory=lambda *a, **kw: ex)
+        session.run_next()
+        return session
+
+    def test_failed_recovery_cannot_advance_or_send_next_suite(self):
+        session = self.failed_session()
+        recovery = Mock()
+        recovery.recover_transport.side_effect = ProbeError("recovery health failed")
+        session.factory = lambda *a, **kw: recovery
+        session.recover("skip")
+        self.assertEqual(session.index, 0)
+        self.assertTrue(session.can_recover)
+        self.assertEqual(session.last_error, "recovery health failed")
+        self.assertEqual(session.summary["steps"][1]["status"], "pending")
+        recovery.close.assert_called_once()
+        recovery.queries.assert_not_called()
+        self.assertEqual(session.summary["recoveries"][-1]["status"], "failed")
+
+    def test_reload_and_skip_preserves_failure_then_allows_next_step(self):
+        original = self.failed_session()
+        session = TestSession.load_failed(original.directory)
+        self.assertTrue(session.can_recover)
+        self.assertIn("LIBUSB_ERROR_PIPE", session.last_error)
+        recovery = Mock()
+        session.factory = lambda *a, **kw: recovery
+        session.recover("skip")
+        self.assertFalse(session.terminal)
+        self.assertEqual(session.index, 1)
+        self.assertEqual(session.summary["steps"][0]["status"], "failed")
+        self.assertEqual(len(list(session.raw_dir.glob("attempt-*/queries.json"))), 1)
+        self.assertIsNone(session.last_error)
+        session.index = len(session.steps)
+        session.complete_if_done()
+        self.assertEqual(session.summary["status"], "observed")
+
+    def test_retry_archives_old_attempt_without_overwriting_evidence(self):
+        session = self.failed_session()
+        original = (session.raw_dir / "queries.json").read_bytes()
+        session.factory = lambda *a, **kw: Mock()
+        session.recover("retry")
+        self.assertEqual(session.index, 0)
+        self.assertEqual(session.summary["steps"][0]["status"], "pending")
+        self.assertFalse((session.raw_dir / "queries.json").exists())
+        self.assertEqual(next(session.raw_dir.glob("attempt-*/queries.json")).read_bytes(), original)
+        session.run_next()
+        self.assertEqual(session.summary["steps"][0]["status"], "passed")
+        self.assertEqual(session.summary["attempts"][0]["steps"][0]["status"], "failed")
+
+    def test_finger_retry_restarts_group_and_invalidates_partial_samples(self):
+        session = TestSession(self.root, "movement", experiment_factory=FingerDevice)
+        session.run_next()
+        def fail(*args):
+            raise ProbeError("simulated transfer failure")
+        session.progress = fail
+        session.run_next()
+        self.assertEqual(session.index, 1)
+        session.factory = lambda *a, **kw: Mock()
+        session.recover("retry")
+        self.assertEqual(session.index, 0)
+        self.assertTrue(all(r["status"] == "pending" for r in session.summary["steps"]))
+        self.assertFalse((session.raw_dir / "movement").exists())
+        archived = next(session.raw_dir.glob("attempt-*/movement/report.json"))
+        report = json.loads(archived.read_text())
+        self.assertEqual(len(report["samples"]), 4)
+        self.assertFalse(report["valid_for_analysis"])
+
+    def test_cancel_recovery_keeps_original_failure_and_position(self):
+        session = self.failed_session()
+        recovery = Mock()
+        recovery.recover_transport.side_effect = lambda: session.stop.set()
+        session.factory = lambda *a, **kw: recovery
+        session.recover("skip")
+        self.assertTrue(session.terminal)
+        self.assertEqual(session.index, 0)
+        self.assertEqual(session.summary["recoveries"][-1]["status"], "cancelled")
+        recovery.close.assert_called_once()
+
     def test_frame_data_hashes_errors_and_stale_trailers_never_export(self):
         for query in ("raw_frame", "extended_frame", "unknown"):
             public = operation_summary({"query": query, "data_hex": "de ad be ef", "response_hex": "private",

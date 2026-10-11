@@ -63,11 +63,11 @@ class Experiment:
             self.stop.wait(seconds)
             self.check_stop()
 
-    def open(self):
+    def open(self, expected_path=None):
         self.check_stop()
         record = {}
         self.report.setdefault("connections", []).append(record)
-        self.usb = open_device(record, 2000)
+        self.usb = open_device(record, 2000, expected_path=expected_path)
         self.transport_healthy = True
 
     def close(self):
@@ -243,6 +243,26 @@ class Experiment:
         self.health("after_usb_reset")
         self.query(INFO["controller_version"], "after_usb_reset/version")
         self.query(INFO["finger_status"], "after_usb_reset/finger")
+
+    def recover_transport(self):
+        """Explicit recovery after a failed transfer; no bulk command before reset."""
+        self.check_stop()
+        self.transport_healthy = False
+        path = (self.report["connections"][-1]["device"].get("sysfs") or {}).get("path")
+        if not path:
+            raise ProbeError("cannot verify physical USB path for recovery")
+        reset = self.usb.lib.libusb_reset_device
+        reset.argtypes, reset.restype = [C.c_void_p], C.c_int
+        code = reset(self.usb.handle)
+        self.report["operations"].append({"label": "recovery/reset_selected_usb_device", "return_code": code})
+        if code == -4:
+            self.usb.claimed = False
+        else:
+            self.usb.check(code, "reset selected USB device for recovery")
+        self.close()
+        self.pause(0.6)
+        self.open(expected_path=path)
+        self.health("recovery/health")
 
     def usb_status(self):
         self.health("baseline")

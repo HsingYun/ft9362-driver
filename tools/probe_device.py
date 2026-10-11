@@ -307,8 +307,7 @@ def run_queries(usb, queries, results):
               f"trailer={result['trailing_hex'] or '(none)'}", flush=True)
 
 
-def open_device(report, timeout_ms, factory=USB, pause=time.sleep):
-    expected_path = None
+def open_device(report, timeout_ms, factory=USB, pause=time.sleep, expected_path=None):
     for attempt in range(2):
         usb = factory(timeout_ms)
         metadata = {}

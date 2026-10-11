@@ -15,7 +15,7 @@ from frame import decode_preview
 
 
 class DeviceTestWindow(Gtk.Window):
-    def __init__(self, parent=None, on_closed=None, scope="full", root=None):
+    def __init__(self, parent=None, on_closed=None, scope="full", root=None, resume_path=None):
         super().__init__(title="FT9362 · 设备测试")
         if parent is not None:
             self.set_transient_for(parent)
@@ -39,6 +39,9 @@ class DeviceTestWindow(Gtk.Window):
         self.scope.set_active_id(scope)
         self.scope.connect("changed", lambda _: self.refresh())
         box.pack_start(self.scope, False, False, 0)
+        self.load_button = Gtk.Button(label="打开失败轮次…")
+        self.load_button.connect("clicked", self.open_failed)
+        box.pack_start(self.load_button, False, False, 0)
         middle = Gtk.Box(spacing=18)
         box.pack_start(middle, True, True, 0)
         scroll = Gtk.ScrolledWindow()
@@ -75,6 +78,16 @@ class DeviceTestWindow(Gtk.Window):
         self.report_button = Gtk.Button(label="打开报告目录")
         self.report_button.connect("clicked", self.open_report)
         controls.pack_start(self.report_button, False, False, 0)
+        recovery = Gtk.Box(spacing=8)
+        box.pack_start(recovery, False, False, 0)
+        self.retry_button = Gtk.Button(label="恢复 USB 后重试")
+        self.retry_button.connect("clicked", lambda _: self.recover_session("retry"))
+        recovery.pack_start(self.retry_button, False, False, 0)
+        self.skip_button = Gtk.Button(label="恢复 USB 后跳过此项")
+        self.skip_button.connect("clicked", lambda _: self.recover_session("skip"))
+        recovery.pack_start(self.skip_button, False, False, 0)
+        if resume_path is not None:
+            self.load_failed(resume_path)
         self.refresh()
 
     def refresh(self):
@@ -90,19 +103,63 @@ class DeviceTestWindow(Gtk.Window):
             session = self.session
             for row in session.summary["steps"]:
                 self.rows.append([row["title"], STATUS[row["status"]]])
-            if session.terminal:
+            if session.can_recover:
+                step = session.steps[session.index]
+                self.prompt.set_text(f"第 {session.index + 1} 步失败：{step.title}\n"
+                                     "请先完全抬手。可复位这一个 USB 设备并验证通信后重试，或保留失败结果并跳过。\n"
+                                     + ("手指测试重试会从本组基线重新开始；跳过会跳过本组剩余步骤。"
+                                        if step.group != "no_finger" else "跳过后会回到下一步，等待你点击执行。"))
+            elif session.terminal:
                 self.prompt.set_text("本轮已结束，请保持手指离开传感器。关闭测试窗口后可手动恢复预览。")
             else:
                 step = session.steps[session.index]
                 self.prompt.set_text(f"{session.index + 1}/{len(session.steps)} · {step.title}\n{step.instruction}")
             self.status.set_text(f"{STATUS[session.summary['status']]}\n报告：{session.directory / 'report.md'}")
+            if session.last_error:
+                self.status.set_text(f"{STATUS[session.summary['status']]}：{session.last_error}\n"
+                                     f"报告：{session.directory / 'report.md'}")
             self.next_button.set_label("确认动作，执行这一步")
         active = self.session is not None and not self.session.terminal
         self.scope.set_sensitive(self.session is None and not self.busy)
         self.next_button.set_sensitive(not self.busy and not self.closing and (self.session is None or active))
-        self.stop_button.set_sensitive(active and not self.closing)
+        self.stop_button.set_sensitive((active or self.busy) and not self.closing)
         self.restart_button.set_sensitive(self.session is not None and not self.busy and not self.closing)
         self.report_button.set_sensitive(self.session is not None)
+        self.load_button.set_sensitive(self.session is None and not self.busy and not self.closing)
+        recoverable = self.session is not None and self.session.can_recover and not self.busy and not self.closing
+        self.retry_button.set_sensitive(recoverable)
+        self.skip_button.set_sensitive(recoverable)
+        finger = self.session is not None and self.session.index < len(self.session.steps) and self.session.steps[self.session.index].group != "no_finger"
+        self.retry_button.set_label("恢复 USB 后重做本组" if finger else "恢复 USB 后重试")
+        self.skip_button.set_label("恢复 USB 后跳过本组" if finger else "恢复 USB 后跳过此项")
+
+    def load_failed(self, directory):
+        self.session = TestSession.load_failed(directory,
+            progress=lambda *args: GLib.idle_add(self.show_frame, *args))
+        self.scope.set_active_id(self.session.summary["scope"])
+        self.refresh()
+
+    def open_failed(self, *_):
+        if self.session is not None or self.busy:
+            return
+        dialog = Gtk.FileChooserDialog(title="选择失败轮次的目录", transient_for=self,
+                                       action=Gtk.FileChooserAction.SELECT_FOLDER)
+        dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "打开", Gtk.ResponseType.OK)
+        if self.root.exists():
+            dialog.set_current_folder(str(self.root))
+        try:
+            if dialog.run() == Gtk.ResponseType.OK:
+                self.load_failed(dialog.get_filename())
+        except Exception as error:
+            self.status.set_text(f"无法打开此轮测试：{error}")
+        finally:
+            dialog.destroy()
+
+    def recover_session(self, action):
+        if self.busy or self.closing or self.session is None or not self.session.can_recover:
+            return
+        self.worker(lambda: self.session.recover(action))
+        self.status.set_text("正在复位指纹 USB 设备、重新打开并验证通信；请保持手指抬起……")
 
     def worker(self, operation):
         self.busy = True

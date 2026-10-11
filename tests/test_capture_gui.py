@@ -144,6 +144,35 @@ class PreviewTest(unittest.TestCase):
         self.assertFalse(w.test_requested)
         self.assertIn("关闭设备失败", w.status.get_text())
 
+    def test_failed_wizard_shows_error_and_requires_recovery_to_continue(self):
+        from device_test_gui import DeviceTestWindow
+        from device_testing import TestSession
+        from probe_device import ProbeError
+        ex = Mock()
+        ex.queries.side_effect = ProbeError("bulk 81: LIBUSB_ERROR_PIPE (-9)")
+        session = TestSession(self.directory, "no_finger", experiment_factory=lambda *a, **kw: ex)
+        session.run_next()
+        wizard = DeviceTestWindow(root=self.directory)
+        try:
+            wizard.session = session
+            wizard.refresh()
+            self.assertFalse(wizard.next_button.get_sensitive())
+            self.assertTrue(wizard.retry_button.get_sensitive())
+            self.assertTrue(wizard.skip_button.get_sensitive())
+            self.assertIn("LIBUSB_ERROR_PIPE", wizard.status.get_text())
+            wizard.busy = True
+            wizard.refresh()
+            self.assertFalse(wizard.retry_button.get_sensitive())
+            self.assertFalse(wizard.skip_button.get_sensitive())
+            wizard.busy = False
+            session.factory = lambda *a, **kw: Mock()
+            session.recover("skip")
+            wizard.refresh()
+            self.assertTrue(wizard.next_button.get_sensitive())
+            self.assertFalse(wizard.retry_button.get_sensitive())
+        finally:
+            wizard.destroy()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,7 @@ wire evidence is private; the exported summary uses explicit field allowlists.
 """
 
 from dataclasses import dataclass
+from copy import deepcopy
 from datetime import datetime, timezone
 import json
 import os
@@ -76,7 +77,8 @@ COMPARISON = (
 COMPARISON_PHASES = (("normal_before", "none"), ("status_only", "status"),
                      ("with_extended", "data"), ("normal_after", "none"))
 STATUS = {"pending": "待执行", "running": "执行中", "passed": "通过", "observed": "完成，含拒绝或不确定项",
-          "blocked": "前置条件阻断", "failed": "失败", "cancelled": "已停止", "invalidated": "已作废"}
+          "blocked": "前置条件阻断", "failed": "失败", "cancelled": "已停止", "invalidated": "已作废",
+          "skipped": "已跳过", "recovering": "正在恢复 USB"}
 
 
 def plan(scope):
@@ -147,12 +149,134 @@ class TestSession:
         self.index = 0
         self.terminal = False
         self.idle_payloads = None
+        self.last_error = None
         self.summary = {"schema_version": 1, "started_utc": utc(), "scope": scope,
                         "valid_for_analysis": True, "completed": False, "status": "pending",
                         "steps": [{"group": s.group, "phase": s.phase, "title": s.title, "status": "pending"}
                                   for s in self.steps],
                         "excluded": ["固件/bootloader", "EC/GPIO", "未知间接寄存器", "运行模式写入", "整机电源切换"]}
         self.save()
+
+    @classmethod
+    def load_failed(cls, directory, progress=None, experiment_factory=Experiment):
+        """Reopen an explicitly selected failed session without touching hardware."""
+        directory = Path(directory).resolve()
+        summary = json.loads((directory / "summary.json").read_text())
+        steps = plan(summary["scope"])
+        if (summary.get("status") != "failed" or summary.get("completed")
+                or not summary.get("valid_for_analysis")
+                or [(r["group"], r["phase"]) for r in summary["steps"]] != [(s.group, s.phase) for s in steps]):
+            raise ValueError("only a valid failed session with the same test plan can be resumed")
+        # Earlier skipped failures may remain in the report. Resume the last failed step.
+        index = max(i for i, r in enumerate(summary["steps"]) if r["status"] == "failed")
+        self = cls.__new__(cls)
+        self.directory, self.raw_dir = directory, directory / "private"
+        self.summary, self.steps, self.index = summary, steps, index
+        self.stop = threading.Event()
+        self.progress = progress or (lambda *args: None)
+        self.factory = experiment_factory
+        self.experiment = self.finger_report = self.finger_path = None
+        self.idle_payloads = None
+        idle = self.raw_dir / "capture_idle.json"
+        if idle.exists():
+            self.idle_payloads = [o["data_hex"] for o in json.loads(idle.read_text()).get("operations", [])
+                                 if o.get("query") == "raw_frame" and o.get("outcome") == "valid_data"]
+        self.terminal = True
+        error = self.raw_dir / "error.json"
+        self.last_error = json.loads(error.read_text()).get("error") if error.exists() else "上次测试失败"
+        return self
+
+    @property
+    def can_recover(self):
+        return (self.terminal and self.summary["status"] == "failed"
+                and self.summary.get("valid_for_analysis") and self.index < len(self.steps)
+                and self.summary["steps"][self.index]["status"] == "failed")
+
+    def complete_if_done(self):
+        if self.index == len(self.steps):
+            self.terminal = True
+            observed = bool(self.summary.get("attempts")) or any(
+                r["status"] != "passed" for r in self.summary["steps"])
+            self.summary.update(completed=True, status="observed" if observed else "passed", finished_utc=utc())
+
+    def recover(self, action):
+        if action not in ("retry", "skip") or not self.can_recover:
+            raise ValueError("recovery requires a failed step and an explicit retry/skip choice")
+        self.stop.clear()
+        self.summary["status"] = "recovering"
+        record = {"started_utc": utc(), "action": action, "step": self.index + 1, "status": "running"}
+        self.summary.setdefault("recoveries", []).append(record)
+        report = {"started_utc": utc(), "operations": [], "completed": False}
+        path = self.raw_dir / ("recovery-" + uuid.uuid4().hex + ".json")
+        try:
+            self.save()
+            save_json(path, report)  # Fail on output errors before touching hardware.
+            experiment = self.factory(report, verbose=False, stop=self.stop)
+            try:
+                experiment.open()
+                experiment.recover_transport()
+            finally:
+                experiment.close()
+            if self.stop.is_set():
+                raise ProbeError("operator stopped recovery")
+            report["completed"] = True
+            self.archive_attempt(action)
+            record["status"] = "passed"
+            self.last_error = None
+            self.summary.update(status="pending", completed=False)
+            self.summary.pop("finished_utc", None)
+            self.summary.pop("cleanup_failed", None)
+            self.terminal = False
+            self.complete_if_done()
+        except Exception as error:
+            self.last_error = str(error)
+            report["error"] = self.last_error
+            record["status"] = "cancelled" if self.stop.is_set() else "failed"
+            self.summary["status"] = "failed"
+            self.terminal = True
+        finally:
+            report["finished_utc"] = record["finished_utc"] = utc()
+            record["operations"] = [operation_summary(op) for op in report["operations"]]
+            save_json(path, report)
+            self.save()
+
+    def archive_attempt(self, action):
+        """Keep failed evidence; restart a finger group from its no-finger baseline."""
+        step = self.steps[self.index]
+        indices = ([self.index] if step.group == "no_finger" else
+                   [i for i, s in enumerate(self.steps) if s.group == step.group])
+        archive = self.raw_dir / ("attempt-" + uuid.uuid4().hex)
+        archive.mkdir(mode=0o700)
+        if step.group == "no_finger":
+            sources = [self.raw_dir / (step.phase + ".json")]
+            if step.phase == "lifecycle":
+                sources.append(self.raw_dir / "lifecycle.log")
+        else:
+            sources = [self.raw_dir / step.group]
+            report_path = sources[0] / "report.json"
+            if report_path.exists():
+                report = json.loads(report_path.read_text())
+                report.update(valid_for_analysis=False, invalidated_reason="incomplete group before USB recovery")
+                save_json(report_path, report)
+        sources += [self.raw_dir / "error.json", self.raw_dir / "close-error.json"]
+        for source in sources:
+            if source.exists():
+                source.rename(archive / source.name)
+        self.summary.setdefault("attempts", []).append({
+            "action": action, "at": utc(), "steps": [deepcopy(self.summary["steps"][i]) for i in indices]})
+        if action == "retry":
+            for i in indices:
+                s = self.steps[i]
+                self.summary["steps"][i] = {"group": s.group, "phase": s.phase, "title": s.title, "status": "pending"}
+            self.index = indices[0]
+        else:
+            for i in indices:
+                row = self.summary["steps"][i]
+                if row["status"] == "pending":
+                    row["status"] = "skipped"
+                row["note"] = "USB 恢复并通过基线验证后，用户选择跳过；失败或未完成项目不算通过。"
+            self.index = indices[-1] + 1
+        self.finger_report = self.finger_path = None
 
     def save(self):
         save_json(self.directory / "summary.json", self.summary)
@@ -173,6 +297,9 @@ class TestSession:
             for key in ("operations", "analysis", "driver", "actions", "buffer_comparison"):
                 if key in row:
                     lines += ["```json", json.dumps(row[key], ensure_ascii=False, indent=2), "```", ""]
+        for key, title in (("attempts", "此前失败的尝试"), ("recoveries", "USB 恢复记录")):
+            if self.summary.get(key):
+                lines += [f"## {title}", "", "```json", json.dumps(self.summary[key], ensure_ascii=False, indent=2), "```", ""]
         path = self.directory / "report.md"
         temporary = path.with_suffix(".tmp")
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -199,7 +326,7 @@ class TestSession:
             self.summary["cleanup_failed"] = True
         if invalidated:
             self.summary.update(valid_for_analysis=False, status="invalidated", completed=False)
-            for path in self.raw_dir.glob("*/report.json"):
+            for path in self.raw_dir.rglob("report.json"):
                 report = json.loads(path.read_text())
                 report["valid_for_analysis"] = False
                 report["invalidated_reason"] = "operator discarded this session"
@@ -229,11 +356,9 @@ class TestSession:
             if row["status"] == "running":
                 row["status"] = "passed"
             self.index += 1
-            if self.index == len(self.steps):
-                self.terminal = True
-                observed = any(r["status"] in ("observed", "blocked") for r in self.summary["steps"])
-                self.summary.update(completed=True, status="observed" if observed else "passed", finished_utc=utc())
+            self.complete_if_done()
         except Exception as error:
+            self.last_error = str(error)
             row["status"] = "cancelled" if self.stop.is_set() else "failed"
             row["note"] = "测试已停止，详情见本轮 private 目录的错误记录。"
             save_json(self.raw_dir / "error.json", {"phase": step.phase, "error": str(error), "at": utc()})
