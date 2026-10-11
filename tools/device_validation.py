@@ -3,8 +3,8 @@
 """One-shot protocol validation. Invoked by the device-test worker only.
 
 The asynchronous transport runs in a subprocess: a wedged USB backend cannot
-prevent the GUI watchdog from stopping the experiment. Existing baseline tests
-gate documented sensor modes on successful initialization/recovery prerequisites.
+prevent the GUI watchdog from stopping the experiment. Baseline mode tests only
+check the wake prerequisite; they never send mode writes, even after an ACK.
 No firmware or system power setting is changed.
 """
 
@@ -23,11 +23,14 @@ import threading
 import time
 
 from device_capabilities import Experiment, INFO, command
-from probe_device import USB, Query, ProbeError, encode_request, open_device, parse_response
+from probe_device import (USB, Query, ProbeError, decode_response, encode_request,
+                          open_device, parse_response, response_size)
 
 
 NORMAL_FRAME = command("raw_frame", "81", 12160)
 EXTENDED_FRAME = command("extended_frame", "82 76 01", 12160)
+MAX_RESPONSE_DATA = NORMAL_FRAME.max_data
+RESPONSE_CAPACITY = ((MAX_RESPONSE_DATA + 6 + 63) // 64) * 64
 STRATEGIES = ("none", "drain", "clear_halt", "reopen", "reset")
 STRATEGY_NAMES = {"none": "直接重新开始", "drain": "有界读取残留", "clear_halt": "仅清除端点 halt",
                   "reopen": "仅关闭重开", "reset": "单设备 USB 复位"}
@@ -218,7 +221,7 @@ class CancelExperiment(Experiment):
                 self.check_stop()
                 if time.monotonic() >= deadline:
                     break
-                data, event = self.usb.transfer_result(0x81, 12224, op["transfers"])
+                data, event = self.usb.transfer_result(0x81, RESPONSE_CAPACITY, op["transfers"])
                 total += len(data)
                 if event["return_code"] == -7 and not data:
                     op.update(bytes_read=total, quiet_timeout=True)
@@ -229,6 +232,66 @@ class CancelExperiment(Experiment):
         finally:
             self.usb.timeout_ms = old_timeout
             self.checkpoint()
+
+    def probe_bridge(self, label):
+        """Measure the first reply without truncating a possible stale image."""
+        self.check_stop()
+        query = INFO["bridge_status"]
+        op = {"label": label, "query": query.name,
+              "request_hex": encode_request(query).hex(" "), "transfers": []}
+        self.report["operations"].append(op)
+        raw = bytearray()
+        old_timeout = self.usb.timeout_ms
+        deadline = time.monotonic() + 5
+        try:
+            self.usb.transfer(3, encode_request(query), op["transfers"])
+            for _ in range(4):
+                self.check_stop()
+                remaining_ms = int((deadline - time.monotonic()) * 1000)
+                if remaining_ms <= 0:
+                    raise ProbeError("bridge probe deadline expired")
+                self.usb.timeout_ms = min(old_timeout, remaining_ms)
+                chunk, event = self.usb.transfer_result(0x81, RESPONSE_CAPACITY, op["transfers"])
+                raw.extend(chunk)
+                op["response_hex"] = raw.hex(" ")
+                self.usb.check(event["return_code"], "bridge probe")
+                if not chunk or len(raw) > MAX_RESPONSE_DATA + 6:
+                    raise ProbeError("invalid bridge probe fragment")
+                size = response_size(raw, MAX_RESPONSE_DATA)
+                if size is None or len(raw) < size:
+                    continue
+                op.update(decode_response(raw, MAX_RESPONSE_DATA))
+                if len(raw) > size + 1:
+                    raise ProbeError("too many bridge probe trailer bytes")
+                if op["status"] != 4 or op["data_hex"] != "55 aa":
+                    op["outcome"] = "unexpected_response"
+                    raise ProbeError("first response is not the expected bridge readiness reply")
+                op["outcome"] = "valid_data"
+                self.transport_healthy = True
+                return
+            raise ProbeError("bridge probe incomplete after 4 fragments")
+        except Exception as error:
+            self.transport_healthy = False
+            op.update(error=str(error))
+            op.setdefault("outcome", "failed")
+            raise
+        finally:
+            self.usb.timeout_ms = old_timeout
+            self.checkpoint()
+
+    def establish_baseline(self, label):
+        # Finish queued input before resetting, including after an earlier run.
+        self.drain()
+        self.reset()
+        self.drain()
+        self.probe_bridge(label + "/probe")
+        self.health(label)
+
+    def cleanup(self):
+        # This is outside the measured recovery. Never turn its failure into a pass.
+        self.drain()
+        self.probe_bridge("cleanup/probe")
+        self.health("cleanup/health")
 
     def recover(self, strategy):
         self.check_stop()
@@ -294,11 +357,11 @@ class CancelExperiment(Experiment):
             return injection_result(event, 0)
         self.usb.transfer(3, request, op["transfers"])
         if case.point == "in":
-            capacity = 12224 if case.query.max_data == 12160 else 64
+            capacity = RESPONSE_CAPACITY if case.query.max_data == MAX_RESPONSE_DATA else 64
             raw, event = self.usb.transfer_result(0x81, capacity, op["transfers"], case.delay_ms)
             op["response_hex"] = raw.hex(" ")
             return injection_result(event, len(raw))
-        capacity = 4096 if case.point in ("partial", "deferred") else 12224
+        capacity = 4096 if case.point in ("partial", "deferred") else RESPONSE_CAPACITY
         raw = bytearray(self.usb.transfer(0x81, capacity, op["transfers"]))
         op["response_hex"] = raw.hex(" ")
         if case.point == "partial":
@@ -325,6 +388,7 @@ class CancelExperiment(Experiment):
         return {"outcome": case.point, "target_hit": True, "consumed_bytes": len(raw)}
 
     def followup(self):
+        self.probe_bridge("followup/probe")
         self.health("followup/health")
         frames = []
         for _ in range(3):
@@ -345,14 +409,15 @@ def run_case(case, strategy, report, stop, checkpoint, factory=CancelExperiment)
     ex = factory(report, stop, checkpoint)
     result = {"case": case.name, "strategy": strategy, "status": "running"}
     report["result"] = result
+    stage = "baseline"
     try:
         ex.open()
-        ex.reset()
-        ex.drain()
-        ex.health("baseline")
+        ex.establish_baseline("baseline")
         result["baseline_valid"] = True
+        stage = "precondition"
         ex.prepare(case.query)
         result["precondition_valid"] = True
+        stage = "injection"
         try:
             result["injection"] = ex.interrupt(case)
         except ProbeError as error:
@@ -360,10 +425,12 @@ def run_case(case, strategy, report, stop, checkpoint, factory=CancelExperiment)
             result["injection"] = {"outcome": "injection_error", "target_hit": False}
         checkpoint()
         ex.check_stop()
+        stage = "recovery"
         recovery_start = len(report["operations"])
         ex.recover(strategy)
         if strategy == "drain":
             result["residual"] = residual_summary(case.query, report["operations"], recovery_start)
+        stage = "followup"
         result["followup"] = ex.followup()
         result["status"] = ("passed" if result["injection"]["target_hit"] else "not_hit")
         if result["injection"]["outcome"] == "injection_error":
@@ -372,15 +439,25 @@ def run_case(case, strategy, report, stop, checkpoint, factory=CancelExperiment)
             result["status"] = "observed"
     except Exception as error:
         report["error"] = str(error)
+        result["failure_stage"] = stage
         result["status"] = "cancelled" if stop.is_set() else (
             "baseline_failed" if not result.get("baseline_valid") else
             "blocked" if not result.get("precondition_valid") else "recovery_failed")
     finally:
+        result["cleanup"] = {"status": "skipped"}
+        if not stop.is_set() and ex.usb is not None:
+            result["cleanup"]["status"] = "running"
+            try:
+                ex.cleanup()
+                result["cleanup"] = {"status": "passed"}
+            except Exception as error:
+                report["cleanup_error"] = str(error)
+                result["cleanup"] = {"status": "failed"}
         try:
             ex.close()
         except Exception as error:
             report["close_error"] = str(error)
-            result["status"] = "cleanup_failed"
+            result["cleanup"].update(status="failed", close_failed=True)
         checkpoint()
     return result
 
@@ -453,11 +530,17 @@ def public_summary(report):
     # Explicit projections: never export USB bytes, frame hashes, metrics or exceptions.
     result = {"completed": bool(report.get("completed")), "cases": [], "sampling": [],
               "limitations": report.get("limitations", [])}
+    if "schema_version" in report:
+        result["schema_version"] = report["schema_version"]
+    result["unattempted_cases"] = [
+        {k: row[k] for k in ("case", "strategy")}
+        for row in report.get("unattempted_cases", [])]
     for row in report.get("cases", []):
-        item = {k: row[k] for k in ("case", "strategy", "status", "baseline_valid", "precondition_valid") if k in row}
+        item = {k: row[k] for k in ("case", "strategy", "status", "failure_stage", "baseline_valid", "precondition_valid") if k in row}
         for key, fields in (("injection", ("outcome", "target_hit", "consumed_bytes", "transfer_status",
                                           "cancel_code", "cancel_called_ms", "elapsed_ms", "actual_length")),
                             ("followup", ("frames", "distinct_payloads", "health_valid")),
+                            ("cleanup", ("status", "close_failed")),
                             ("residual", ("received_before_recovery", "residual_bytes", "reconstructed_response_valid"))):
             if key in row:
                 item[key] = {k: row[key][k] for k in fields if k in row[key]}
@@ -473,7 +556,7 @@ def public_summary(report):
 
 def run_suite(path, stop):
     from device_testing import TestSession
-    report = {"schema_version": 1, "experiment": "protocol_validation", "completed": False,
+    report = {"schema_version": 2, "experiment": "protocol_validation", "completed": False,
               "started_unix_ns": time.time_ns(),
               "cases": [], "sampling": [], "limitations": [
                   "USB cancellation matrix tests libusb directly, not phase instrumentation of the libfprint driver.",
@@ -484,7 +567,8 @@ def run_suite(path, stop):
                   "A valid response and changing frames cannot prove freshness without a device sequence number.",
                   "Reported frame rate includes Python, USB queries and report checkpoints; not the hardware ceiling.",
                   "No DPI, ADC precision, calibration, internal processing or matching accuracy measurement.",
-                  "Baseline mode tests require successful initialization/recovery prerequisites; rejection leaves modes unresolved.",
+                  "Mode tests only check the wake prerequisite; no mode writes are sent even after an ACK.",
+                  "Post-case cleanup is separate from the measured recovery and does not change its result.",
                   "No firmware, EC/GPIO, unknown register writes or whole-system suspend.",
                   "No hardware temperature measurement; timed capture tests continuity only."]}
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -497,9 +581,7 @@ def run_suite(path, stop):
     try:
         progress("先保持抬手，正在建立通信基线……")
         ex.open()
-        ex.reset()
-        ex.drain()
-        ex.health("initial")
+        ex.establish_baseline("initial")
         ex.wait_contact(False, 30)
         selected_path = prelude["connections"][-1]["device"]["sysfs"]["path"]
         prelude["expected_path"] = selected_path
@@ -586,15 +668,14 @@ def run_suite(path, stop):
             result = run_case(case, strategy, case_report, stop, checkpoint)
             report["cases"].append(result)
             save(path, report)
-            if result["status"] in ("baseline_failed", "cleanup_failed", "blocked", "cancelled"):
+            if (result["status"] in ("baseline_failed", "blocked", "cancelled")
+                    or result.get("cleanup", {}).get("status") == "failed"):
                 raise ProbeError("cannot continue from failed baseline, contact gate, cleanup or operator stop")
         progress("全部组合已完成。现在抬起手指，正在进行最终恢复和检查。")
         final = {"operations": [], "expected_path": selected_path}
         ex = CancelExperiment(final, stop, lambda: save(path.parent / "final.json", final))
         ex.open()
-        ex.reset()
-        ex.drain()
-        ex.health("final")
+        ex.establish_baseline("final")
         ex.wait_contact(False, 60)
         ex.close()
         report["completed"] = True
@@ -608,6 +689,8 @@ def run_suite(path, stop):
             report["close_error"] = str(error)
             report["completed"] = False
         report["finished_unix_ns"] = time.time_ns()
+        report["unattempted_cases"] = [{"case": case.name, "strategy": strategy}
+                                       for case, strategy in CASES[len(report["cases"]):]]
         save(path, report)
     return report
 

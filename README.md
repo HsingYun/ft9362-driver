@@ -15,7 +15,7 @@ nix develop
 python tools/capture.py
 ```
 
-The GUI starts a live preview without saving automatically. It supports pausing, recording by finger, appending recording sessions, and exporting the current frame. The same entry point provides terminal capture and offline preview:
+The GUI starts a live preview without saving automatically. It supports pausing, recording by finger, appending recording sessions, exporting the current frame, and device diagnostics. Comprehensive protocol validation runs all stages automatically with guided finger actions. The same entry point provides terminal capture and offline preview:
 
 ```sh
 python tools/capture.py --cli --count 3 --timeout 30
@@ -48,22 +48,22 @@ The detailed guides are currently in Chinese:
 - [Usage guide](docs/usage.md): running the tools, recording, exporting, and troubleshooting.
 - [Development guide](docs/development.md): builds, tests, the state machine, memory ownership, and the C++ interface contract.
 - [Algorithm design](docs/matching-design.md): enrollment, matching, templates, CNN/BRISK candidate designs, and acceptance criteria; algorithm selection remains open and depends on sensor data evaluation.
-- [Protocol and data format](docs/protocol.md): commands, raw frames, historical sample evidence, and unresolved questions.
+- [Protocol and data format](docs/protocol.md): commands, raw frames, sample evidence, and unresolved questions.
+- [Device capabilities](docs/device-capability.md): hardware observations, evidence scope, and unverified capabilities.
 - [Windows porting reference](docs/windows-reference.md): behavior differences, commands, and evidence checked against device models and runtime branches.
 
 ```sh
 nix build
-python tests/test_capture_tools.py
-nix develop -c python tests/test_capture_gui.py
+nix develop -c python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-The build includes C/C++ tests. GUI tests require a desktop display and do not access the sensor. Hardware validation steps are documented in the [development guide](docs/development.md).
+The build includes C/C++ tests. The Python command discovers all Python tests without accessing the sensor. GUI tests require a desktop display and are skipped when none is available. Hardware validation steps are documented in the [development guide](docs/development.md).
 
 ## Acknowledgments and License
 
 This project is based on **Ivan Kovalev**'s [ft9362-driver](https://github.com/shokerplz/ft9362-driver). Thanks to the original author for the driver implementation and exploratory work, and to the [libfprint](https://gitlab.freedesktop.org/libfprint/libfprint) project for its framework.
 
-Changes in this branch as of 2026-10-11 include the raw capture state machine, independent C++ interface, GUI / CLI capture and recording tools, regression tests, protocol research, and repository reorganization. These changes are specific to this branch and do not represent the original author's upstream implementation.
+This branch provides the raw capture state machine, independent C++ interface, GUI / CLI capture and recording tools, device diagnostics, and regression tests. Protocol research documents the evidence and validation limits. The development behavior in this branch does not represent the original author's upstream implementation.
 
 The code remains licensed under **LGPL-2.1-or-later**, with the original copyright notices preserved. See [LICENSE](LICENSE) for the full terms. Redistributed modifications must retain the applicable copyright, license, and modification notices; binary distribution also requires providing corresponding source and meeting the other applicable license obligations. The software is provided without warranty as stated in the license.
 

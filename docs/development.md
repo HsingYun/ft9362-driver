@@ -2,15 +2,13 @@
 
 ## 构建与测试
 
-[flake.nix](../flake.nix) 在锁定的 libfprint 上加入驱动，注册 USB ID，并接入 C/C++ 回归测试。算法入口为 [entry.h](../driver/algorithm/entry.h) / [entry.cpp](../driver/algorithm/entry.cpp)，由独立的 [Meson 目标](../driver/algorithm/meson.build)生成 `libfocaltech.0752.algo.so`，通过 C ABI 动态链接到 libfprint。算法源码不再直接编译进 libfprint 或测试程序。
+[flake.nix](../flake.nix) 在锁定的 libfprint 上加入驱动，注册 USB ID，并接入 C/C++ 回归测试。算法入口为 [entry.h](../driver/algorithm/entry.h) / [entry.cpp](../driver/algorithm/entry.cpp)，由独立的 [Meson 目标](../driver/algorithm/meson.build)生成 `libfocaltech.0752.algo.so`，通过 C ABI 动态链接到 libfprint。算法源码由共享库目标编译，libfprint 与测试程序链接该库。
 
 构建产物包含 `lib/libfprint-2.so`、`lib/libfocaltech.0752.algo.so`、类型库和 udev 规则，不包含系统 fprintd 配置。算法库没有 GLib 或 libfprint 依赖；驱动测试与独立 C ABI 测试均链接同一个算法共享库。
 
 ```sh
 nix build
-nix develop
-python tests/test_capture_tools.py
-python tests/test_capture_gui.py
+nix develop -c python -m unittest discover -s tests -p 'test_*.py'
 ```
 
 Nix 构建执行 libfprint 构建检查以及本工程的 C/C++ 测试。GUI 测试使用模拟设备，需要显示服务；没有显示时会跳过，不能将跳过计为通过。
@@ -21,6 +19,10 @@ Nix 构建执行 libfprint 构建检查以及本工程的 C/C++ 测试。GUI 测
 | [test-ft9362-algorithm.c](../tests/test-ft9362-algorithm.c) | 由 C 调用独立 C++ ABI，验证输入、占位行为和释放约定 |
 | [test_capture_tools.py](../tests/test_capture_tools.py) | 数据解码、导出权限、入口路径和 SQLite 会话 |
 | [test_capture_gui.py](../tests/test_capture_gui.py) | 预览、录制边界、PNG 导出、离线模式、冷却重试及设备测试入口 |
+| [test_probe_device.py](../tests/test_probe_device.py) | 封包、解析、长度边界及打开重试 |
+| [test_device_capabilities.py](../tests/test_device_capabilities.py) | 设备实验的前置条件、异常中止及恢复 |
+| [test_device_testing.py](../tests/test_device_testing.py) | 会话计划、报告、恢复与续测 |
+| [test_analyze_finger_interaction.py](../tests/test_analyze_finger_interaction.py) | 响应与样本一致性、无效记录拒绝 |
 | [test_device_validation.py](../tests/test_device_validation.py) | 异步取消竞争、回调生命周期、恢复隔离、残留校验、报告脱敏及整轮自动执行；不访问硬件 |
 
 修改 Git 工作树时，Nix 的 Git 输入只收集已纳入 Git 的文件；新源码或改名文件需先纳入版本控制。临时使用 `nix build path:.` 可包含未跟踪文件，但也会包含 Git 忽略的文件，使用前须确保源目录没有采集数据。不要为了构建提交原始指纹数据。
@@ -28,11 +30,13 @@ Nix 构建执行 libfprint 构建检查以及本工程的 C/C++ 测试。GUI 测
 ## 代码职责
 
 ```text
-Python GUI / CLI
-  → libfprint FpDevice 接口
-  → C 驱动：USB、采集状态机、取消、FpPrint 适配
-  → C ABI：完整帧与模板视图
-  → libfocaltech.0752.algo.so：录入、1:1 认证、1:N 识别
+预览 / 录制 / CLI 采集
+  → libfprint → C 驱动（USB、状态机、FpPrint 适配）
+  → C ABI → libfocaltech.0752.algo.so
+
+GUI 设备测试
+  → 测试会话 → 独占 USB 的协议实验与证据保存
+  → 生命周期子进程 → libfprint
 ```
 
 | 模块 | 职责 |
@@ -41,13 +45,15 @@ Python GUI / CLI
 | [entry.h](../driver/algorithm/entry.h) | 仅依赖标准 C 类型的接口和数据结构 |
 | [entry.cpp](../driver/algorithm/entry.cpp) | 可替换的 C++ 后端，当前复制原始帧并旁路匹配 |
 | [meson.build](../driver/algorithm/meson.build) | 算法共享库的构建、链接依赖与安装定义 |
-| [capture.py](../tools/capture.py) | 唯一公开入口、参数和 CLI；仅 GUI 模式加载 GTK |
+| [capture.py](../tools/capture.py) | 用户采集入口、参数和 CLI；仅 GUI 模式加载 GTK |
 | [gui.py](../tools/gui.py) | 异步预览、采集控制、录制操作和图片导出 |
 | [frame.py](../tools/frame.py) | 原始帧提取、文件保存与显示解码，无 GI 依赖 |
 | [recording.py](../tools/recording.py) | SQLite 持久化与录制会话，无 GI 依赖 |
+| [device_test_gui.py](../tools/device_test_gui.py) / [device_testing.py](../tools/device_testing.py) | 测试界面、会话计划、报告及恢复流程 |
+| [probe_device.py](../tools/probe_device.py) / [device_capabilities.py](../tools/device_capabilities.py) | libusb 封装、协议解析及有界设备实验 |
 | [device_validation.py](../tools/device_validation.py) | 综合协议验证子进程、真实 libusb 取消及独立恢复实验，复用既有测试会话与报告 |
 
-工具入口与界面依赖共用数据模块，数据模块不反向导入入口。新工具能力通过现有 GUI / CLI 提供，避免增加重复入口。
+采集入口和界面共用帧解码与录制模块。设备测试通过 GUI 启动，由测试会话串行管理 USB 所有权；底层脚本入口用于开发调试。诊断报告与采集数据分开保存。
 
 ## 驱动生命周期
 
@@ -96,7 +102,7 @@ stateDiagram-v2
 
 后端仅使用 C/C++ 标准库及系统基础运行环境，不引入第三方库，包括仅头文件或静态嵌入的库。它不接收任何 GLib、GObject、GUsb 或 libfprint 对象；图像处理、匹配和必要的模型前向计算自行实现，算法方案见[算法设计](matching-design.md)。离线训练工具不得成为算法库的构建或运行依赖。C 适配层负责系统接口，后端负责数据处理；无需在 C++ 中重复构造 libfprint 状态机。
 
-算法通过共享库导出四个 C 接口，函数名和数据结构保持不变。新增内部实现文件时加入算法的 Meson 目标。动态链接采用常规共享库依赖，部署时须同时提供 libfprint 与算法库；Nix 构建负责设置安装后的库查找路径，无需手动设置 `LD_LIBRARY_PATH`。Nix store 产物不可原地替换，更新算法后重新构建即可。
+算法共享库导出以下四个 C 接口；数据结构以 [entry.h](../driver/algorithm/entry.h) 为准。新增内部实现文件时加入算法的 Meson 目标。动态链接采用常规共享库依赖，部署时须同时提供 libfprint 与算法库；Nix 构建负责设置安装后的库查找路径，无需手动设置 `LD_LIBRARY_PATH`。Nix store 产物不可原地替换，更新算法后重新构建即可。
 
 | 接口 | 当前行为 | 真正实现的职责 |
 | --- | --- | --- |
@@ -119,7 +125,7 @@ C 适配层持有输入 GVariant，直到后端调用结束。不存在或不符
 
 录入成功必须返回非空模板。认证、识别的 `scanned` 可全零，表示不附带本次扫描模板；当前 C++ 后端仍返回完整原始帧。非空输出必须同时具有有效格式标签、数据和非零长度。
 
-libfprint 1.94.100 对匹配成功时附带的 RAW 扫描模板增加了一致性检查。C 适配层仅在扫描模板与匹配的参考模板相等时附带它，否则传 `NULL`；未匹配时仍可返回扫描模板。匹配结论仍由后端决定，这项检查不执行指纹相似度匹配，也不影响录入接口和 Python 原始帧采集。
+libfprint 1.94.100 要求匹配成功时附带的 RAW 扫描模板与参考模板相等。C 适配层仅在扫描模板与匹配的参考模板相等时附带它，否则传 `NULL`；未匹配时仍可返回扫描模板。匹配结论仍由后端决定，这项检查不执行指纹相似度匹配，也不影响录入接口和 Python 原始帧采集。
 
 `FT9362_STATUS_OK` 只代表处理成功，是否匹配由 `matched` 或 `matched_index` 表达。`FT9362_NO_MATCH` 为 `SIZE_MAX`；其他索引须在原图库范围内。非法模板映射为 `FP_DEVICE_ERROR_DATA_INVALID`，未实现映射为 `FP_DEVICE_ERROR_NOT_SUPPORTED`，其他失败映射为一般设备错误。
 
@@ -143,4 +149,31 @@ C 模拟器使用带正确头部、长度和 BCC 的合成图像，普通与扩�
 
 C/C++ 格式遵循 [driver/.clang-format](../driver/.clang-format)。改动应同时更新相关测试和对应文档；新增抽象须服务于真实的状态、所有权或业务边界。
 
-综合协议验证通过现有设备测试下拉列表运行，计划与证据边界见[设备能力记录第 13 节](device-capability.md#13-综合协议验证入口)。取消矩阵直接使用 libusb，不声称命中了 libfprint 内部的某个状态；生产驱动的中途取消恢复仍需依据实机报告决策。异步传输的缓冲与回调保留到完成回调后再释放，外层子进程看门狗负责处理后端失去响应。不要把 USB 超时冒充取消命中。
+### 综合协议验证
+
+综合验证通过 [device_validation.py](../tools/device_validation.py) 子进程执行，使用真实 libusb 异步取消。等待手指的生命周期测试调用 libfprint；图像采样和取消矩阵直接使用 libusb，不能声称命中了 C 驱动内部某个采集状态。操作入口见[使用指南](usage.md#设备测试与报告)。
+
+| 阶段 | 自动收集的证据 |
+| --- | --- |
+| 通信基线 | 复用既有 11 项无手指测试：信息、尾字节顺序、USB 状态、独占、唤醒/模式前提、固定缓冲、重开、复位和 libfprint 等待取消 |
+| 通道对照 | 普通读取、附加扩展状态、附加条件扩展取图，各两轮、每轮 10 帧；固定种子打乱顺序并记录，轮前刷新普通缓冲 |
+| 接触与图像 | 轻触、正常力度各 12 帧；滚动 16 帧；约 60 秒连续采集；抬手后的 3 帧；记录双通道原始值、灰度分布、邻接差异与帧间时序 |
+| 取消对照 | 不提交目标命令、完整普通/扩展事务、读取首块后记录取消意图但读完普通/扩展事务，共 5 项；这些对照不调用 USB 取消 |
+| 中断 × 恢复 | 9 个中断时机 × 5 种独立恢复方式，共 45 项；加上述对照合计 50 项 |
+| 最终收尾 | 排空残留、复位所选设备、检查桥接/应用/尺寸、等待抬手、释放接口 |
+
+中断时机覆盖状态命令写入/响应读取、普通命令写入/读取 1 ms/首 4096 字节后、扩展命令写入/读取 1 ms/读取 50 ms/首 4096 字节后。进行中的传输调用真实 `libusb_cancel_transfer`；首块后停止是**两次读取之间的中断**，不能冒充正在进行的 USB 请求被取消。“先读完再取消”是协议策略实验，尚未修改生产驱动。
+
+恢复方式分别为直接重新开始、有界 IN 读取残留、仅清除 IN/OUT halt、仅关闭重开、单设备 USB reset。每项基线按排空→复位→排空→桥接探测→健康查询建立；排空失败时不执行基线复位。注入故障后只使用该项指定的方法，再验证桥接/应用/尺寸及三次完整采集。测量中的 reset 不附带排空，否则不能独立评价 reset 的效果。
+
+桥接探测每次 IN 提供 12,224 字节容量，可完整接收已知最大图像响应；最多四次读取、总预算 5 秒，要求长度、BCC、成功状态及 `55 AA` 均成立，允许至多一个包外字节。第一个响应不匹配即判失败，不继续搜索后续正确应答来宣称恢复成功。这样既保留陈旧应答证据，也避免用 64 字节缓冲主动截断旧图像。格式合法仍不能证明归属：协议没有事务序号，旧桥接应答可能与新应答相同。
+
+每项测量结束后，单独执行排空→桥接探测→健康查询→释放接口。清理不改变被测恢复结果，也不隐式复位；清理失败则停止整轮。排空最多 4 次、每次 200 ms、总预算 1 秒，以无数据超时结束；该短暂静默不证明设备永远没有延迟响应，因此还需健康查询。排空策略保存取消时已收字节与测量阶段残留字节，重建旧响应并校验 BCC；用例收尾的字节不混入该策略的结果。
+
+取消太晚、传输已完成时记为 `not_hit`；恢复失败记为 `recovery_failed`，同时记录失败阶段和独立的 `cleanup` 结果。基线失败不代表该项恢复方式失败，因为此时尚未注入故障。基线、接触前提、清理或接口释放失败时停止，未开始的组合列入 `unattempted_cases`。无手指阶段沿用既有失败记录机制，自动尝试一次单设备恢复后跳过失败项；恢复失败则停止。报告中的“完成”仅表示流程跑完，不表示全部恢复方式有效。综合报告结构版本为 2；版本 1 的恢复后健康查询使用 64 字节缓冲，且用例间没有上述清理，分析旧报告需保留这一测试条件差异。
+
+详细证据保存在本轮 `private/validation/`：总索引、各取消组合、各采样阶段和逐帧 USB 记录。公开报告仅包含状态、长度、时序、帧数和不同载荷数量；图像、像素统计、摘要与异常文本留在私有目录。后续分析需要整个轮次目录，不能只提供公开报告。原始图像不纳入版本控制。
+
+子进程独占 USB，GUI 不持有其传输对象；异步缓冲和回调保留到完成回调后再释放。停止时请求取消并等待回调，跳过主动清理命令并释放接口；超过 8 秒由父进程终止。超过 120 秒没有阶段进展，或整轮运行超过 20 分钟，也会触发看门狗。停止或强制终止不保证设备协议已同步，报告保留不完整状态；重新运行本项会先尝试建立新基线。
+
+此入口的模式项只检查唤醒前提，即使收到 ACK 也不发送 `87`。不操作固件、EC/GPIO、未知寄存器或整机 suspend。DPI、ADC 精度、固件内部处理、校准、实际温度和匹配准确率仍需其他证据。动作提示不是独立的接触/压力测量；帧率包含 Python、状态查询和报告保存开销，不是传感器极限。

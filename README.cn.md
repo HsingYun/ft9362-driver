@@ -15,7 +15,7 @@ nix develop
 python tools/capture.py
 ```
 
-默认打开 GUI 并开始预览，不自动保存。GUI 支持暂停、按手指录制、追加录制和导出当前帧。终端采集与离线预览使用同一入口：
+默认打开 GUI 并开始预览，不自动保存。GUI 支持暂停、按手指录制、追加录制、导出当前帧和设备诊断。综合协议验证可一次执行全部阶段，按界面提示完成手指动作。终端采集与离线预览使用同一入口：
 
 ```sh
 python tools/capture.py --cli --count 3 --timeout 30
@@ -46,21 +46,21 @@ python tools/capture.py --preview /path/to/frame.bin
 - [使用指南](docs/usage.md)：运行、录制、导出与故障排查。
 - [开发指南](docs/development.md)：构建测试、状态机、内存所有权与 C++ 接口契约。
 - [算法设计](docs/matching-design.md)：录入、匹配、模板、CNN／BRISK 候选设计与验收；开放算法选型，最终方案由设备样本评估确定。
-- [协议与数据格式](docs/protocol.md)：命令、原始帧、历史样本证据及未知项。
+- [协议与数据格式](docs/protocol.md)：命令、原始帧、样本证据及未知项。
+- [设备能力](docs/device-capability.md)：本机实测结论、证据范围和待验证能力。
 - [Windows 移植参考](docs/windows-reference.md)：按型号与分支核对的行为差异、命令和移植依据。
 
 ```sh
 nix build
-python tests/test_capture_tools.py
-nix develop -c python tests/test_capture_gui.py
+nix develop -c python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-构建包含 C/C++ 测试；GUI 测试需要桌面显示服务，不访问传感器。硬件验证步骤见[开发指南](docs/development.md)。
+构建包含 C/C++ 测试；Python 命令发现并运行全部 Python 测试，不访问传感器。GUI 测试需要桌面显示服务，无显示时跳过。硬件验证步骤见[开发指南](docs/development.md)。
 
 ## 致谢与许可证
 
 本项目基于 **Ivan Kovalev** 的 [ft9362-driver](https://github.com/shokerplz/ft9362-driver)，感谢原作者的驱动实现与探索工作，以及 [libfprint](https://gitlab.freedesktop.org/libfprint/libfprint) 项目提供的框架。
 
-本分支截至 2026-10-11 的修改包括：原始帧采集状态机、独立 C++ 接口、GUI / CLI 采集与录制工具、回归测试、协议研究和工程结构整理。这些修改不代表原作者的上游实现。
+本分支提供原始帧采集状态机、独立 C++ 接口、GUI / CLI 采集与录制工具、设备诊断及回归测试；协议研究文档说明实现依据与验证边界。本分支实现不代表原作者的上游实现。
 
 代码继续采用 **LGPL-2.1-or-later**，保留原作者版权声明，许可证全文见 [LICENSE](LICENSE)。分发修改版本时请保留版权、许可证及修改说明；分发二进制还须按许可证提供相应源码及履行其他适用义务。软件按许可证所述不提供担保。[Windows 驱动附件](attachments/README.md)为厂商原始分析样本，其权利归原权利人，不适用本项目的 LGPL 声明；本仓库不授予其再分发许可。
