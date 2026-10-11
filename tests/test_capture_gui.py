@@ -35,6 +35,18 @@ class PreviewTest(unittest.TestCase):
         w.destroy()
         self.tmp.cleanup()
 
+    def test_validation_scope_is_one_automatic_run_and_shows_action_prompts(self):
+        from device_test_gui import DeviceTestWindow
+        window = DeviceTestWindow(scope="validation", root=self.directory)
+        try:
+            self.assertEqual(window.scope.get_active_id(), "validation")
+            self.assertEqual(len(window.rows), 1)
+            window.show_frame(None, "现在抬手", 3, 50)
+            self.assertEqual(window.prompt.get_text(), "现在抬手")
+            self.assertIn("无需点击", window.status.get_text())
+        finally:
+            window.destroy()
+
     def test_recording_boundaries_and_export(self):
         w = self.window
         w.running = True

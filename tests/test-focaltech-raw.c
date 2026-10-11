@@ -67,12 +67,53 @@ typedef enum {
   OPTIONAL_SCAN,
   CANCEL_PARTIAL_FRAME,
   CANCEL_SUCCESSFUL_FRAME,
+  CONTINUOUS_CAPTURE,
+  EXTENDED_NOT_READY,
+  BAD_STATUS_BCC,
+  BAD_STATUS_LENGTH,
+  UNKNOWN_STATUS,
+  BAD_FRAME_HEADER,
+  BAD_FRAME_BCC,
+  BAD_FRAME_LENGTH,
+  FRAME_REJECTED,
+  FRAME_EMPTY_ACK,
+  FRAME_WITHOUT_TRAILER,
+  EXTENDED_WITHOUT_TRAILER,
+  STATUS_WITHOUT_TRAILER,
+  EXTRA_STATUS_BYTES,
+  UNKNOWN_EXTENDED_STATUS,
+  EXTENDED_REJECTED,
+  BAD_EXTENDED_FRAME,
+  CANCEL_EXTENDED_FRAME,
+  REPLY_DEADLINE,
+  COALESCED_REPLIES,
+  SINGLE_READ_FRAME,
+  SPLIT_HEADER,
 } Scenario;
 
 static Scenario scenario;
 static guint8 expected[FT9362_RAW_FRAME_SIZE];
 static gsize frame_offset;
 static guint captures;
+static guint extended_polls;
+static guint extended_captures;
+static gboolean finger_down;
+static gboolean frame_ready;
+static GQueue replies = G_QUEUE_INIT;
+
+typedef enum {
+  POLL_REPLY,
+  FRAME_REPLY,
+  EXTENDED_STATUS_REPLY,
+  EXTENDED_FRAME_REPLY
+} ReplyKind;
+typedef struct {
+  guint8 bytes[FT9362_RAW_FRAME_SIZE + 2];
+  gsize size;
+  gsize offset;
+  ReplyKind kind;
+} Reply;
+
 static guint polls;
 static guint status_reads;
 static guint frame_reads;
@@ -153,82 +194,184 @@ static gboolean cancel_cb(gpointer data) {
   return G_SOURCE_REMOVE;
 }
 
+static guint8 test_bcc(const guint8* bytes, gsize size) {
+  guint8 result = 0;
+  for (gsize i = 0; i < size; i++) {
+    result ^= bytes[i];
+  }
+  return result;
+}
+
+static void update_frame_checksum(void) {
+  expected[12164] = test_bcc(expected + 1, 12163);
+}
+
+static void queue_reply(ReplyKind kind) {
+  Reply* reply = g_new0(Reply, 1);
+  reply->kind = kind;
+  if (kind == FRAME_REPLY || kind == EXTENDED_FRAME_REPLY) {
+    memcpy(reply->bytes, expected, sizeof(expected));
+    reply->size = sizeof(expected);
+    if (kind == EXTENDED_FRAME_REPLY) {
+      for (gsize i = 4; i < 12164; i++) {
+        reply->bytes[i] ^= 0xa5;
+      }
+      reply->bytes[12164] = test_bcc(reply->bytes + 1, 12163);
+    }
+    if (scenario == BAD_FRAME_HEADER) {
+      reply->bytes[0] = 0xff;
+    } else if (scenario == BAD_FRAME_LENGTH) {
+      reply->bytes[1] = 0xff;
+    } else if (scenario == BAD_FRAME_BCC || (scenario == BAD_EXTENDED_FRAME && kind == EXTENDED_FRAME_REPLY)) {
+      reply->bytes[12164] ^= 1;
+    } else if (scenario == FRAME_REJECTED || scenario == FRAME_EMPTY_ACK) {
+      const guint8 rejected[] = {2, 0, 1, 9, 8, 0x93};
+      memcpy(reply->bytes, rejected, sizeof(rejected));
+      reply->size = sizeof(rejected);
+      if (scenario == FRAME_EMPTY_ACK) {
+        reply->bytes[3] = 4;
+        reply->bytes[4] = 5;
+      }
+    } else if (scenario == FRAME_WITHOUT_TRAILER || (scenario == EXTENDED_WITHOUT_TRAILER && kind == EXTENDED_FRAME_REPLY)) {
+      reply->size--;
+    }
+  } else {
+    const guint8 response[] = {2, 0, 2, 4, 0, 6, 0xf8};
+    memcpy(reply->bytes, response, sizeof(response));
+    reply->size = sizeof(response);
+    reply->bytes[4] = kind == POLL_REPLY ? frame_ready : (finger_down ? 5 : 6);
+    if (scenario == UNKNOWN_STATUS && kind == POLL_REPLY) {
+      reply->bytes[4] = 7;
+    } else if (scenario == UNKNOWN_EXTENDED_STATUS && kind == EXTENDED_STATUS_REPLY) {
+      reply->bytes[4] = 7;
+    }
+    reply->bytes[5] = test_bcc(reply->bytes + 1, 4);
+    if (kind == POLL_REPLY) {
+      if (scenario == SHORT_STATUS) {
+        reply->size = 5;
+      } else if (scenario == BAD_STATUS_HEADER) {
+        reply->bytes[0] = 0xff;
+      } else if (scenario == BAD_STATUS_TYPE) {
+        reply->bytes[3] = 9;
+        reply->bytes[5] = test_bcc(reply->bytes + 1, 4);
+      } else if (scenario == BAD_STATUS_BCC) {
+        reply->bytes[5] ^= 1;
+      } else if (scenario == BAD_STATUS_LENGTH) {
+        reply->bytes[2] = 3;
+      } else if (scenario == STATUS_WITHOUT_TRAILER) {
+        reply->size--;
+      } else if (scenario == EXTRA_STATUS_BYTES) {
+        reply->size++;
+      } else if (scenario == COALESCED_REPLIES) {
+        memcpy(reply->bytes + 7, reply->bytes, 7);
+        reply->size = 14;
+      }
+    } else if (scenario == EXTENDED_REJECTED) {
+      const guint8 rejected[] = {2, 0, 1, 9, 8, 0x93};
+      memcpy(reply->bytes, rejected, sizeof(rejected));
+      reply->size = sizeof(rejected);
+    }
+  }
+  g_queue_push_tail(&replies, reply);
+}
+
 static gboolean deliver(gpointer data) {
   Pending* pending = data;
   FpiUsbTransfer* transfer = pending->transfer;
+  Reply* reply = g_queue_peek_head(&replies);
   GError* error = NULL;
+  gboolean out = transfer->endpoint == 0x03;
+  gboolean normal_capture = out && transfer->length == sizeof(expected_capture_command);
 
   if (g_cancellable_set_error_if_cancelled(pending->cancellable, &error)) {
-  } else if (scenario == USB_ERROR || (scenario == USB_STATUS_ERROR && transfer->endpoint == 0x81 && transfer->length == 64) || (scenario == USB_CAPTURE_ERROR && transfer->endpoint == 0x03 && transfer->length == sizeof(expected_capture_command)) ||
-             (scenario == USB_PARTIAL_FRAME_ERROR && transfer->endpoint == 0x81 && transfer->length == 12166 && frame_offset == 4096)) {
+  } else if (scenario == USB_ERROR || (scenario == USB_STATUS_ERROR && !out && reply && reply->kind == POLL_REPLY) || (scenario == USB_CAPTURE_ERROR && normal_capture) || (scenario == USB_PARTIAL_FRAME_ERROR && !out && reply && reply->kind == FRAME_REPLY && reply->offset == 4096)) {
     usb_failures++;
     error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_FAILED, "Simulated USB failure");
-  } else if (transfer->endpoint == USB_ENDPOINT_OUT) {
-    if (transfer->length == sizeof(expected_capture_command)) {
+  } else if (out) {
+    ReplyKind kind;
+    if (normal_capture) {
       g_assert_cmpmem(transfer->buffer, transfer->length, expected_capture_command, sizeof(expected_capture_command));
-      frame_offset = 0;
+      kind = FRAME_REPLY;
       captures++;
-    } else {
+      frame_offset = 0;
+    } else if (transfer->buffer[3] == 0x80) {
       g_assert_cmpmem(transfer->buffer, transfer->length, expected_poll_command, sizeof(expected_poll_command));
+      kind = POLL_REPLY;
       polls++;
-    }
-    transfer->actual_length = transfer->length;
-    /* Deliberately return no GError: the driver must validate OUT lengths,
-     * including zero, independently of libfprint's short_is_error handling.
-     */
-    if ((scenario == ZERO_POLL_WRITE && transfer->length == sizeof(expected_poll_command)) || (scenario == ZERO_CAPTURE_WRITE && transfer->length == sizeof(expected_capture_command))) {
-      transfer->actual_length = 0;
-    } else if ((scenario == SHORT_POLL_WRITE && transfer->length == sizeof(expected_poll_command)) || (scenario == SHORT_CAPTURE_WRITE && transfer->length == sizeof(expected_capture_command))) {
-      transfer->actual_length--;
-    }
-  } else if (transfer->length == STATUS_REPLY_CAPACITY) {
-    const guint8 response[] = {0x02, 0x00, 0x02, 0x04, 0x01, 0x07, 0xf8};
-    memcpy(transfer->buffer, response, sizeof(response));
-    transfer->actual_length = sizeof(response);
-    status_reads++;
-    /* Only corrupt the first response, so a regression fails rather than
-     * hanging forever if the driver incorrectly retries malformed packets.
-     */
-    if (status_reads == 1) {
-      if (scenario == EMPTY_STATUS) {
-        transfer->actual_length = 0;
-      } else if (scenario == SHORT_STATUS) {
-        transfer->actual_length = STATUS_REPLY_MIN_SIZE - 1;
-      } else if (scenario == OVERSIZED_STATUS) {
-        transfer->actual_length = transfer->length + 1;
-      } else if (scenario == BAD_STATUS_HEADER) {
-        transfer->buffer[0] = 0xff;
-      } else if (scenario == BAD_STATUS_TYPE) {
-        transfer->buffer[3] = 0xff;
+      g_assert_cmpuint(polls, <, 20);
+      if (scenario == WAIT_THEN_READY && status_reads >= 2) {
+        frame_ready = TRUE;
+        finger_down = TRUE;
+      }
+    } else {
+      static const guint8 poll[] = {2, 0, 3, 0x82, 0x73, 1, 0xf3};
+      static const guint8 image[] = {2, 0, 3, 0x82, 0x76, 1, 0xf6};
+      if (transfer->buffer[4] == 0x73) {
+        g_assert_cmpmem(transfer->buffer, transfer->length, poll, sizeof(poll));
+        kind = EXTENDED_STATUS_REPLY;
+        extended_polls++;
+      } else {
+        g_assert_cmpmem(transfer->buffer, transfer->length, image, sizeof(image));
+        kind = EXTENDED_FRAME_REPLY;
+        extended_captures++;
+        g_assert_true(finger_down);
       }
     }
-    if (scenario == WAIT_THEN_READY && status_reads <= 2) {
-      transfer->buffer[4] = 0;
+    transfer->actual_length = transfer->length;
+    if ((scenario == ZERO_POLL_WRITE && kind == POLL_REPLY) || (scenario == ZERO_CAPTURE_WRITE && kind == FRAME_REPLY)) {
+      transfer->actual_length = 0;
+    } else if ((scenario == SHORT_POLL_WRITE && kind == POLL_REPLY) || (scenario == SHORT_CAPTURE_WRITE && kind == FRAME_REPLY)) {
+      transfer->actual_length--;
+    } else {
+      queue_reply(kind);
     }
-    if (scenario == CANCEL_TIMER) {
-      transfer->buffer[4] = 0;
-      /* Run after on_finger_status_received has installed its timer. */
-      g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, cancel_cb, g_object_ref(pending->cancellable), g_object_unref);
-    }
+  } else if (!reply) {
+    error = g_error_new_literal(G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT, "No queued USB response");
   } else {
-    frame_reads++;
-    gsize size = MIN((gsize)4096, FT9362_RAW_FRAME_SIZE - frame_offset);
-    if (scenario == EMPTY_FRAME) {
+    gboolean image = reply->kind == FRAME_REPLY || reply->kind == EXTENDED_FRAME_REPLY;
+    if (reply->kind == POLL_REPLY) {
+      status_reads++;
+    } else if (reply->kind == FRAME_REPLY) {
+      frame_reads++;
+    }
+    gsize chunk = scenario == SINGLE_READ_FRAME ? FT9362_RAW_FRAME_SIZE : 4096;
+    if (scenario == SPLIT_HEADER && reply->offset < 3) {
+      chunk = 1;
+    }
+    gsize size = MIN((gsize)transfer->length, MIN(chunk, reply->size - reply->offset));
+    if ((scenario == EMPTY_FRAME && image) || (scenario == EMPTY_STATUS && !image)) {
       size = 0;
     }
-    if (scenario == OVERSIZED_FRAME && frame_offset > 0) {
-      size = FT9362_RAW_FRAME_SIZE;
-    }
-    memset(transfer->buffer, 0, transfer->length);
-    if (scenario != OVERSIZED_FRAME || frame_offset == 0) {
-      memcpy(transfer->buffer, expected + frame_offset, size);
-    }
+    memcpy(transfer->buffer, reply->bytes + reply->offset, size);
     transfer->actual_length = size;
-    frame_offset += size;
-    if (scenario == CANCEL_SUCCESSFUL_FRAME && frame_offset == FT9362_RAW_FRAME_SIZE) {
-      g_assert_no_error(error);
-      g_assert_cmpuint(FPI_DEVICE_FOCALTECH0752(transfer->device)->capture.bytes_received, ==, FT9362_RAW_FRAME_SIZE - size);
+    reply->offset += size;
+    if (reply->kind == FRAME_REPLY) {
+      frame_offset = reply->offset;
+    }
+    if (scenario == OVERSIZED_STATUS && !image) {
+      transfer->actual_length = transfer->length + 1;
+    } else if (scenario == OVERSIZED_FRAME && image && reply->offset > 4096) {
+      transfer->actual_length = transfer->length + 1;
+    }
+    gboolean final_normal_frame = reply->kind == FRAME_REPLY && reply->offset == reply->size;
+    if (reply->offset == reply->size) {
+      if (reply->kind == FRAME_REPLY) {
+        frame_ready = FALSE;
+      } else if (reply->kind == EXTENDED_FRAME_REPLY) {
+        frame_ready = scenario != EXTENDED_NOT_READY;
+        if (scenario == EXTENDED_NOT_READY) {
+          finger_down = FALSE;
+        }
+      } else if (reply->kind == EXTENDED_STATUS_REPLY && reply->bytes[4] == 6 && (scenario == CANCEL_TIMER || scenario == EXTENDED_NOT_READY)) {
+        g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, cancel_cb, g_object_ref(pending->cancellable), g_object_unref);
+      }
+      g_free(g_queue_pop_head(&replies));
+    }
+    if (scenario == CANCEL_SUCCESSFUL_FRAME && final_normal_frame) {
       g_cancellable_cancel(pending->cancellable);
+    }
+    if (scenario == REPLY_DEADLINE && image) {
+      FPI_DEVICE_FOCALTECH0752(transfer->device)->capture.reply_deadline_us = g_get_monotonic_time() - 1;
     }
   }
 
@@ -250,8 +393,10 @@ static void fake_submit(FpiUsbTransfer* transfer, guint timeout, GCancellable* c
     g_assert_true(transfer->short_is_error);
   } else {
     g_assert_cmpuint(transfer->endpoint, ==, 0x81);
-    g_assert_true(transfer->length == 64 || transfer->length == 12166);
-    g_assert_cmpuint(timeout, ==, transfer->length == 64 ? 1000 : 5000);
+    g_assert_cmpuint(transfer->length % 64, ==, 0);
+    g_assert_cmpuint(timeout, >, 0);
+    Ft9362CapturePhase phase = fpi_ssm_get_cur_state(transfer->ssm);
+    g_assert_cmpuint(timeout, <=, phase == CAPTURE_READ_FRAME || phase == CAPTURE_READ_EXTENDED_FRAME ? 5000 : 1000);
     g_assert_false(transfer->short_is_error);
   }
   pending->transfer = transfer;
@@ -259,11 +404,8 @@ static void fake_submit(FpiUsbTransfer* transfer, guint timeout, GCancellable* c
   pending->callback = callback;
   pending->user_data = user_data;
   pending_transfers++;
-  if (scenario == CANCEL_PENDING) {
-    g_cancellable_cancel(cancellable);
-  }
-  if (scenario == CANCEL_PARTIAL_FRAME && transfer->endpoint == 0x81 && transfer->length == 12166 && frame_offset == 4096) {
-    g_assert_cmpuint(FPI_DEVICE_FOCALTECH0752(transfer->device)->capture.bytes_received, ==, 4096);
+  Reply* reply = g_queue_peek_head(&replies);
+  if (scenario == CANCEL_PENDING || ((scenario == CANCEL_PARTIAL_FRAME || scenario == CANCEL_EXTENDED_FRAME) && transfer->endpoint == 0x81 && reply && reply->offset == 4096)) {
     g_cancellable_cancel(cancellable);
   }
   g_idle_add(deliver, pending);
@@ -308,6 +450,12 @@ static FpDevice* create_device(Scenario test_scenario) {
   status_reads = 0;
   frame_reads = 0;
   frame_offset = 0;
+  extended_polls = 0;
+  extended_captures = 0;
+  g_queue_clear_full(&replies, g_free);
+  finger_down = test_scenario != WAIT_THEN_READY && test_scenario != CANCEL_TIMER;
+  frame_ready = finger_down && test_scenario != CONTINUOUS_CAPTURE && test_scenario != EXTENDED_WITHOUT_TRAILER && test_scenario != UNKNOWN_EXTENDED_STATUS && test_scenario != EXTENDED_REJECTED && test_scenario != BAD_EXTENDED_FRAME && test_scenario != CANCEL_EXTENDED_FRAME &&
+                test_scenario != EXTENDED_NOT_READY;
   g_assert_cmpuint(pending_transfers, ==, 0);
   action_completions = 0;
   algorithm_calls = 0;
@@ -317,6 +465,11 @@ static FpDevice* create_device(Scenario test_scenario) {
   for (gsize i = 0; i < FT9362_RAW_FRAME_SIZE; i++) {
     expected[i] = (i * 37 + 11) & 0xff;
   }
+  expected[0] = 2;
+  expected[1] = 0x2f;
+  expected[2] = 0x81;
+  expected[3] = 4;
+  update_frame_checksum();
   dev = g_object_new(fpi_device_focaltech0752_get_type(), NULL);
   g_type_class_unref(klass);
   return dev;
@@ -489,8 +642,14 @@ static void test_failure(gconstpointer data) {
   if (test_scenario == CANCEL_PENDING || test_scenario == CANCEL_TIMER) {
     g_assert_error(error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
   } else {
-    g_assert_error(error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO);
+    if (test_scenario == SHORT_STATUS || test_scenario == REPLY_DEADLINE) {
+      g_assert_error(error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT);
+    } else {
+      g_assert_error(error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO);
+    }
   }
+  g_assert_cmpuint(algorithm_calls, ==, 0);
+  g_assert_cmpuint(action_completions, ==, 1);
   if (test_scenario == ZERO_POLL_WRITE || test_scenario == SHORT_POLL_WRITE) {
     g_assert_cmpuint(polls, ==, 1);
     g_assert_cmpuint(status_reads, ==, 0);
@@ -529,6 +688,20 @@ static FpPrint* new_reference(FpDevice* dev, const guint8* bytes) {
   return print;
 }
 
+static void assert_queued_reply_rejected(FpDevice* dev, FpPrint* reference) {
+  g_autoptr(GError) error = NULL;
+  g_autoptr(FpPrint) scanned = NULL;
+  gboolean matched = FALSE;
+  guint calls = algorithm_calls;
+  scenario = NORMAL;
+  g_assert_false(fp_device_verify_sync(dev, reference, NULL, NULL, NULL, &matched, &scanned, &error));
+  g_assert_error(error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO);
+  g_assert_false(matched);
+  g_assert_null(scanned);
+  g_assert_cmpuint(algorithm_calls, ==, calls);
+  assert_capture_idle(dev);
+}
+
 static void test_usb_error_and_restart(gconstpointer data) {
   Scenario test_scenario = GPOINTER_TO_INT(data);
   FpDevice* dev = new_device(test_scenario);
@@ -552,8 +725,16 @@ static void test_usb_error_and_restart(gconstpointer data) {
   g_assert_cmpuint(frame_offset, ==, test_scenario == USB_PARTIAL_FRAME_ERROR ? 4096 : 0);
   assert_capture_idle(dev);
 
+  if (test_scenario == USB_STATUS_ERROR || test_scenario == USB_PARTIAL_FRAME_ERROR) {
+    g_assert_false(g_queue_is_empty(&replies));
+    assert_queued_reply_rejected(dev, reference);
+    close_device(dev);
+    return;
+  }
+  g_assert_true(g_queue_is_empty(&replies));
   scenario = NORMAL;
-  expected[0] ^= 0xff;
+  expected[4] ^= 0xff;
+  update_frame_checksum();
   g_clear_error(&error);
   g_assert_true(fp_device_verify_sync(dev, reference, NULL, NULL, NULL, &matched, &scanned, &error));
   g_assert_no_error(error);
@@ -592,13 +773,21 @@ static void test_cancel_and_restart(gconstpointer data) {
   }
   assert_capture_idle(dev);
 
+  if (test_scenario == CANCEL_PARTIAL_FRAME) {
+    g_assert_false(g_queue_is_empty(&replies));
+    assert_queued_reply_rejected(dev, reference);
+    close_device(dev);
+    return;
+  }
+  g_assert_true(g_queue_is_empty(&replies));
   guint previous_polls = polls;
   scenario = test_scenario == CANCEL_TIMER ? WAIT_THEN_READY : NORMAL;
   status_reads = 0;
   gint64 restart_time = g_get_monotonic_time();
-  for (gsize i = 0; i < sizeof(expected); i++) {
+  for (gsize i = 4; i < 12164; i++) {
     expected[i] ^= 0xff;
   }
+  update_frame_checksum();
   g_clear_error(&error);
   g_assert_true(fp_device_verify_sync(dev, reference, NULL, NULL, NULL, &matched, &scanned, &error));
   g_assert_no_error(error);
@@ -692,6 +881,66 @@ static void test_algorithm_identify(gconstpointer data) {
   close_device(dev);
 }
 
+static void test_continuous_capture(void) {
+  FpDevice* dev = new_device(CONTINUOUS_CAPTURE);
+  for (guint i = 0; i < 3; i++) {
+    g_autoptr(GError) error = NULL;
+    expected[4]++;
+    expected[12165] ^= 0xff;
+    update_frame_checksum();
+    g_autoptr(FpPrint) print = fp_device_enroll_sync(dev, fp_print_new(dev), NULL, NULL, NULL, &error);
+    g_assert_no_error(error);
+    assert_raw(print);
+    assert_capture_idle(dev);
+    g_assert_true(finger_down);
+    g_assert_false(frame_ready);
+    g_assert_true(g_queue_is_empty(&replies));
+    g_assert_cmpuint(captures, ==, i + 1);
+    g_assert_cmpuint(extended_captures, ==, i + 1);
+    g_assert_cmpuint(extended_polls, ==, i + 1);
+    g_assert_cmpuint(polls, ==, 2 * (i + 1));
+  }
+  g_assert_cmpuint(algorithm_calls, ==, 3);
+  close_device(dev);
+}
+
+static void test_response_delivery(gconstpointer data) {
+  FpDevice* dev = new_device(GPOINTER_TO_INT(data));
+  g_autoptr(GError) error = NULL;
+  g_autoptr(FpPrint) print = fp_device_enroll_sync(dev, fp_print_new(dev), NULL, NULL, NULL, &error);
+  g_assert_no_error(error);
+  assert_raw(print);
+  g_assert_true(g_queue_is_empty(&replies));
+  g_assert_cmpuint(extended_captures, ==, scenario == EXTENDED_WITHOUT_TRAILER ? 1 : 0);
+  g_assert_cmpuint(frame_reads, ==, scenario == SINGLE_READ_FRAME ? 1 : (scenario == SPLIT_HEADER ? 6 : 3));
+  close_device(dev);
+}
+
+static void test_extended_cancel(gconstpointer data) {
+  Scenario test_scenario = GPOINTER_TO_INT(data);
+  FpDevice* dev = new_device(test_scenario);
+  g_autoptr(FpPrint) reference = new_reference(dev, expected);
+  g_autoptr(GError) error = NULL;
+  g_autoptr(GCancellable) cancellable = g_cancellable_new();
+  gboolean matched = FALSE;
+  g_assert_false(fp_device_verify_sync(dev, reference, cancellable, NULL, NULL, &matched, NULL, &error));
+  g_assert_error(error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+  g_assert_cmpuint(algorithm_calls, ==, 0);
+  g_assert_cmpuint(action_completions, ==, 1);
+  g_assert_cmpuint(captures, ==, 0);
+  g_assert_cmpuint(extended_captures, ==, 1);
+  assert_capture_idle(dev);
+  if (test_scenario == CANCEL_EXTENDED_FRAME) {
+    g_assert_false(g_queue_is_empty(&replies));
+    assert_queued_reply_rejected(dev, reference);
+  } else {
+    g_assert_true(g_queue_is_empty(&replies));
+    g_assert_cmpuint(polls, ==, 2);
+    g_assert_cmpuint(extended_polls, ==, 2);
+  }
+  close_device(dev);
+}
+
 int main(int argc, char** argv) {
   g_test_init(&argc, &argv, NULL);
   g_autoptr(GUsbDevice) usb = g_object_new(G_USB_TYPE_DEVICE, NULL);
@@ -728,8 +977,30 @@ int main(int argc, char** argv) {
   g_test_add_data_func("/focaltech-raw/algorithm/identify-second", GINT_TO_POINTER(IDENTIFY_SECOND), test_algorithm_identify);
   g_test_add_data_func("/focaltech-raw/algorithm/identify-no-match", GINT_TO_POINTER(IDENTIFY_NO_MATCH), test_algorithm_identify);
   g_test_add_data_func("/focaltech-raw/algorithm/invalid-index", GINT_TO_POINTER(IDENTIFY_INVALID_INDEX), test_algorithm_identify);
-  g_test_add_data_func("/focaltech-raw/cancel-partial-frame-and-restart", GINT_TO_POINTER(CANCEL_PARTIAL_FRAME), test_cancel_and_restart);
+  g_test_add_data_func("/focaltech-raw/cancel-partial-frame-with-residual", GINT_TO_POINTER(CANCEL_PARTIAL_FRAME), test_cancel_and_restart);
   g_test_add_data_func("/focaltech-raw/cancel-successful-frame-and-restart", GINT_TO_POINTER(CANCEL_SUCCESSFUL_FRAME), test_cancel_and_restart);
   g_test_add_data_func("/focaltech-raw/cancel-timer-and-restart", GINT_TO_POINTER(CANCEL_TIMER), test_cancel_and_restart);
+  g_test_add_func("/focaltech-raw/continuous-capture", test_continuous_capture);
+  g_test_add_data_func("/focaltech-raw/status-without-trailer", GINT_TO_POINTER(STATUS_WITHOUT_TRAILER), test_response_delivery);
+  g_test_add_data_func("/focaltech-raw/single-read-frame", GINT_TO_POINTER(SINGLE_READ_FRAME), test_response_delivery);
+  g_test_add_data_func("/focaltech-raw/split-header", GINT_TO_POINTER(SPLIT_HEADER), test_response_delivery);
+  g_test_add_data_func("/focaltech-raw/extended-cancel", GINT_TO_POINTER(CANCEL_EXTENDED_FRAME), test_extended_cancel);
+  g_test_add_data_func("/focaltech-raw/extended-still-not-ready", GINT_TO_POINTER(EXTENDED_NOT_READY), test_extended_cancel);
+  g_test_add_data_func("/focaltech-raw/bad-status-bcc", GINT_TO_POINTER(BAD_STATUS_BCC), test_failure);
+  g_test_add_data_func("/focaltech-raw/bad-status-length", GINT_TO_POINTER(BAD_STATUS_LENGTH), test_failure);
+  g_test_add_data_func("/focaltech-raw/unknown-status", GINT_TO_POINTER(UNKNOWN_STATUS), test_failure);
+  g_test_add_data_func("/focaltech-raw/bad-frame-header", GINT_TO_POINTER(BAD_FRAME_HEADER), test_failure);
+  g_test_add_data_func("/focaltech-raw/bad-frame-bcc", GINT_TO_POINTER(BAD_FRAME_BCC), test_failure);
+  g_test_add_data_func("/focaltech-raw/bad-frame-length", GINT_TO_POINTER(BAD_FRAME_LENGTH), test_failure);
+  g_test_add_data_func("/focaltech-raw/frame-rejected", GINT_TO_POINTER(FRAME_REJECTED), test_failure);
+  g_test_add_data_func("/focaltech-raw/frame-empty-ack", GINT_TO_POINTER(FRAME_EMPTY_ACK), test_failure);
+  g_test_add_data_func("/focaltech-raw/extended-without-trailer", GINT_TO_POINTER(EXTENDED_WITHOUT_TRAILER), test_response_delivery);
+  g_test_add_data_func("/focaltech-raw/frame-without-trailer", GINT_TO_POINTER(FRAME_WITHOUT_TRAILER), test_failure);
+  g_test_add_data_func("/focaltech-raw/extra-status-bytes", GINT_TO_POINTER(EXTRA_STATUS_BYTES), test_failure);
+  g_test_add_data_func("/focaltech-raw/unknown-extended-status", GINT_TO_POINTER(UNKNOWN_EXTENDED_STATUS), test_failure);
+  g_test_add_data_func("/focaltech-raw/extended-rejected", GINT_TO_POINTER(EXTENDED_REJECTED), test_failure);
+  g_test_add_data_func("/focaltech-raw/bad-extended-frame", GINT_TO_POINTER(BAD_EXTENDED_FRAME), test_failure);
+  g_test_add_data_func("/focaltech-raw/reply-deadline", GINT_TO_POINTER(REPLY_DEADLINE), test_failure);
+  g_test_add_data_func("/focaltech-raw/coalesced-replies", GINT_TO_POINTER(COALESCED_REPLIES), test_failure);
   return g_test_run();
 }

@@ -20,7 +20,8 @@ Nix 构建执行 libfprint 构建检查以及本工程的 C/C++ 测试。GUI 测
 | [test-focaltech-raw.c](../tests/test-focaltech-raw.c) | USB 回调、分块重组、状态流转、取消、异常和 libfprint 动作完成 |
 | [test-ft9362-algorithm.c](../tests/test-ft9362-algorithm.c) | 由 C 调用独立 C++ ABI，验证输入、占位行为和释放约定 |
 | [test_capture_tools.py](../tests/test_capture_tools.py) | 数据解码、导出权限、入口路径和 SQLite 会话 |
-| [test_capture_gui.py](../tests/test_capture_gui.py) | 预览、录制边界、PNG 导出、离线模式及冷却重试 |
+| [test_capture_gui.py](../tests/test_capture_gui.py) | 预览、录制边界、PNG 导出、离线模式、冷却重试及设备测试入口 |
+| [test_device_validation.py](../tests/test_device_validation.py) | 异步取消竞争、回调生命周期、恢复隔离、残留校验、报告脱敏及整轮自动执行；不访问硬件 |
 
 修改 Git 工作树时，Nix 的 Git 输入只收集已纳入 Git 的文件；新源码或改名文件需先纳入版本控制。临时使用 `nix build path:.` 可包含未跟踪文件，但也会包含 Git 忽略的文件，使用前须确保源目录没有采集数据。不要为了构建提交原始指纹数据。
 
@@ -44,6 +45,7 @@ Python GUI / CLI
 | [gui.py](../tools/gui.py) | 异步预览、采集控制、录制操作和图片导出 |
 | [frame.py](../tools/frame.py) | 原始帧提取、文件保存与显示解码，无 GI 依赖 |
 | [recording.py](../tools/recording.py) | SQLite 持久化与录制会话，无 GI 依赖 |
+| [device_validation.py](../tools/device_validation.py) | 综合协议验证子进程、真实 libusb 取消及独立恢复实验，复用既有测试会话与报告 |
 
 工具入口与界面依赖共用数据模块，数据模块不反向导入入口。新工具能力通过现有 GUI / CLI 提供，避免增加重复入口。
 
@@ -58,25 +60,35 @@ Python GUI / CLI
 ```mermaid
 stateDiagram-v2
     [*] --> SEND_POLL
-    SEND_POLL --> READ_STATUS: 查询命令写入完成
-    READ_STATUS --> WAIT_POLL: 状态不为 01
+    SEND_POLL --> READ_STATUS: 普通查询写入完成
+    READ_STATUS --> SEND_COMMAND: 普通状态 01
+    READ_STATUS --> SEND_EXTENDED_POLL: 普通状态 00
+    SEND_EXTENDED_POLL --> READ_EXTENDED_STATUS: 扩展查询写入完成
+    READ_EXTENDED_STATUS --> SEND_EXTENDED_COMMAND: 扩展状态 05
+    READ_EXTENDED_STATUS --> WAIT_POLL: 扩展状态 06
     WAIT_POLL --> SEND_POLL: 等待 50 ms
-    READ_STATUS --> SEND_COMMAND: 检测到手指
-    SEND_COMMAND --> READ_FRAME: 采集命令写入完成
-    READ_FRAME --> READ_FRAME: 尚未收满
-    READ_FRAME --> [*]: 收满 12166 字节
+    SEND_EXTENDED_COMMAND --> READ_EXTENDED_FRAME: 扩展取图写入完成
+    READ_EXTENDED_FRAME --> READ_EXTENDED_FRAME: 响应未完整
+    READ_EXTENDED_FRAME --> SEND_POLL: 校验通过并消费
+    SEND_COMMAND --> READ_FRAME: 普通取图写入完成
+    READ_FRAME --> READ_FRAME: 响应未完整
+    READ_FRAME --> [*]: 普通帧校验通过
 ```
 
-USB 错误、短写、无效状态响应、空帧片段、越界片段或取消均结束状态机。状态机成功后才调用后端；无论成功或失败，动作完成前都清理缓存并复位手指状态。
+四个读取状态共用响应接收器，状态包也允许分块。传输错误、短写、协议错误或取消结束状态机；只有正常完成普通帧才调用后端。通用协议校验接受零或一个包外字节；普通帧在交付前另行检查 12,166 字节保存契约，扩展帧不受该契约约束。扩展图像用于推进固件刷新，完整消费后丢弃，不替代普通图像。此流程来自[实机通道对照](device-capability.md)，新驱动的连续采集和时序仍需实机验收。
 
 必须保持以下不变量：
 
 - 每个动作最多一个状态机、一个待完成 USB 传输；主循环串行推进。
-- 只按 `actual_length` 累计数据，不把分配容量当作有效数据，也不截断超量响应。
-- 当前每次帧读取申请 12,166 字节；响应不得超过剩余空间。恰好收满后完成，无图像头或 XOR 校验。
+- 只按 `actual_length` 累计数据，请求容量按 64 字节对齐；不把分配容量当作有效数据，不截断超量响应。
+- 普通与扩展响应均验证起始标记、长度、BCC、设备状态、预期数据长度及包外字节数；校验完成前不交付后端。格式见[协议文档](protocol.md)。
+- 每条 OUT 最多 1 秒；OUT 成功后开始单条响应总预算，状态 1 秒、图像 5 秒。`reply_deadline_us` 保存单调时钟上的截止时间（微秒），后续分块仅使用剩余时间，不受系统校时影响；它不是等待手指的总时限。
 - 每次提交使用 libfprint 当前动作的 cancellable。存在待完成传输时，取消先等待 USB 回调，避免提前释放状态机。
-- USB 回调先清除 `transfer_pending`，再检查动作取消；取消优先于普通传输错误。仅有轮询延时时，取消先撤销延时再结束状态机。
-- 错误所有权交给对应完成接口后不再使用；一个动作只完成一次。
+- USB 回调先清除 `transfer_pending`，再检查动作取消；取消优先于普通传输错误。仅有轮询延时时，取消撤销延时并结束状态机。
+- 普通 00 是未就绪，不保证手指离开；扩展读完后必须重新查询普通状态。不能据此实现录入时的抬手计数。
+- 错误所有权交给对应完成接口后不再使用；一个动作只完成一次。成功或失败均清理主机缓存并复位上报状态。
+
+取消 USB 请求并不等于撤销设备命令。传输中途取消或错误可能留下完整或部分应答，后续动作会验证实际读到的数据，但没有序列号可证明所有合法应答都属于本次请求。当前没有硬件 STOP、自动排空或设备重同步，不能承诺此时再次开始即可恢复。等待轮询期间取消与传输中取消必须分别验收；不要通过模拟器清空队列来掩盖后者。
 
 缓冲区清零用于清理驱动状态，不代表 GLib、序列化对象、文件或系统内存中的其他副本也已擦除。
 
@@ -121,10 +133,14 @@ libfprint 1.94.100 对匹配成功时附带的 RAW 扫描模板增加了一致�
 
 硬件变更除自动测试外，应验证：首次打开采集、连续采集、抬指重放、等待手指时取消、传输中取消、关闭重开，以及拔插后的错误恢复。若涉及电源，还需验证冷启动、挂起/恢复。自动测试不能证明固件状态或设备时序正确。
 
-协议工作先参考[Windows 移植参考](windows-reference.md)，核对目标 PID、运行时分支和证据来源，再实现初始化、状态解析、长度与 XOR 检查。不要将其他控制器的固件或 C652 专用服务行为用于 FT9362。
+协议工作先参考[Windows 移植参考](windows-reference.md)，核对目标 PID、运行时分支和证据来源，再扩展初始化与恢复；保持已实现的状态、长度和 BCC 校验。不要将其他控制器的固件或 C652 专用服务行为用于 FT9362。
 
-现有 C 测试包含用于验证字节保留的合成帧，并不全部是校验正确的设备协议包。新增协议校验时，应补充合法帧、损坏帧及传输边界案例，不应简单删除失败测试。
+C 模拟器使用带正确头部、长度和 BCC 的合成图像，普通与扩展载荷刻意不同。OUT 生成响应并入队，IN 消费队首；取消或错误不清空设备队列。覆盖整帧/分块读取、拆分头部、连续接触刷新、扩展读取后仍未就绪、扩展响应无包外字节、损坏响应、设备拒绝、总截止时间、取消与残留响应拒绝。后端输出按字节比对普通帧，确保扩展数据和尾字节不会混入像素或被替换。
+
+这些测试验证软件边界，不证明设备真实队列行为，也不覆盖所有可能合法的陈旧应答。新固件返回格式、帧间时序和取消恢复需另行实测；不得把模拟器中的恢复结果推广为硬件保证。
 
 显示变换集中于 [frame.py](../tools/frame.py)，始终保存未经显示处理的原始数据。算法评估应按独立采集会话划分数据，避免把相邻帧作为相互独立的验证样本。
 
 C/C++ 格式遵循 [driver/.clang-format](../driver/.clang-format)。改动应同时更新相关测试和对应文档；新增抽象须服务于真实的状态、所有权或业务边界。
+
+综合协议验证通过现有设备测试下拉列表运行，计划与证据边界见[设备能力记录第 13 节](device-capability.md#13-综合协议验证入口)。取消矩阵直接使用 libusb，不声称命中了 libfprint 内部的某个状态；生产驱动的中途取消恢复仍需依据实机报告决策。异步传输的缓冲与回调保留到完成回调后再释放，外层子进程看门狗负责处理后端失去响应。不要把 USB 超时冒充取消命中。

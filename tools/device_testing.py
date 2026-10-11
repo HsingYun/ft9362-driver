@@ -95,6 +95,10 @@ def plan(scope):
         steps.extend(Step("movement", *values) for values in MOVEMENT)
     if scope in ("full", "comparison"):
         steps.extend(Step("comparison", *values) for values in COMPARISON)
+    if scope == "validation":
+        steps.append(Step("validation", "all", "综合协议验证（自动执行全部阶段）",
+                          "先完全抬手，点击一次执行。随后按界面提示放手、轻触、滚动、抬手和重按；无需切换项目。"
+                          "约 5–10 分钟；会主动取消 USB 传输，并多次复位这个指纹设备。"))
     if not steps:
         raise ValueError("unknown test scope")
     return steps
@@ -294,7 +298,7 @@ class TestSession:
             if row["status"] == "pending":
                 continue
             lines += [f"## {row['title']}", "", f"结果：{STATUS[row['status']]}", row.get("note", ""), ""]
-            for key in ("operations", "analysis", "driver", "actions", "buffer_comparison"):
+            for key in ("operations", "analysis", "driver", "actions", "buffer_comparison", "validation"):
                 if key in row:
                     lines += ["```json", json.dumps(row[key], ensure_ascii=False, indent=2), "```", ""]
         for key, title in (("attempts", "此前失败的尝试"), ("recoveries", "USB 恢复记录")):
@@ -350,6 +354,8 @@ class TestSession:
                 raise ProbeError("stopped")
             if step.group == "no_finger":
                 self.run_no_finger(step.phase, row)
+            elif step.group == "validation":
+                self.run_validation(row)
             else:
                 self.run_finger(step, row)
             row.setdefault("note", "步骤执行完成；具体能力状态见记录。")
@@ -375,6 +381,48 @@ class TestSession:
         finally:
             row["finished_utc"] = utc()
             self.save()
+
+    def run_validation(self, row):
+        from device_validation import public_summary
+        directory = self.raw_dir / "validation"
+        directory.mkdir(mode=0o700)
+        path = directory / "report.json"
+        with (directory / "worker.log").open("x", encoding="utf-8") as log:
+            os.chmod(log.name, 0o600)
+            process = subprocess.Popen([sys.executable, str(Path(__file__).with_name("device_validation.py")),
+                                        "--report", str(path)], stdout=log, stderr=subprocess.STDOUT)
+            deadline = time.monotonic() + 1200
+            last_update = time.monotonic()
+            previous = None
+            interrupted = False
+            try:
+                while process.poll() is None:
+                    if path.exists():
+                        report = json.loads(path.read_text())
+                        progress = report.get("progress")
+                        if progress != previous:
+                            last_update = time.monotonic()
+                            previous = progress
+                            if progress:
+                                self.progress(None, progress["message"], progress["completed"], progress["total"])
+                    if self.stop.wait(0.1) or time.monotonic() > deadline or time.monotonic() - last_update > 120:
+                        interrupted = True
+                        break
+            finally:
+                if process.poll() is None:
+                    process.send_signal(signal.SIGINT)
+                    try:
+                        process.wait(timeout=8)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+            if path.exists():
+                report = json.loads(path.read_text())
+                row["validation"] = public_summary(report)
+            if interrupted or process.returncode or not path.exists() or not report.get("completed"):
+                raise ProbeError("综合验证未完成；已保留阶段报告，详见 private/validation。")
+            row["status"] = "observed"
+            row["note"] = "完整执行；取消未命中、恢复失败、阻断项和未验证能力分别记录，不等于全部通过。"
 
     def run_no_finger(self, phase, row):
         path = self.raw_dir / (phase + ".json")

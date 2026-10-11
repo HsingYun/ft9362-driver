@@ -18,15 +18,37 @@ enum {
   USB_INTERFACE = 0,
   USB_ENDPOINT_IN = 0x81,
   USB_ENDPOINT_OUT = 0x03,
-  STATUS_REPLY_CAPACITY = 64,
-  STATUS_REPLY_MIN_SIZE = 7,
+  USB_PACKET_SIZE = 64,
+  IMAGE_DATA_SIZE = 12160,
   COMMAND_TIMEOUT_MS = 1000,
   FRAME_TIMEOUT_MS = 5000,
   FINGER_POLL_INTERVAL_MS = 50
 };
 
+enum {
+  REPLY_START_BYTE = 0x02,
+  REPLY_SUCCESS = 0x04,
+  REPLY_LENGTH_OFFSET = 1,
+  REPLY_HEADER_SIZE = 3,
+  REPLY_STATUS_OFFSET = REPLY_HEADER_SIZE,
+  REPLY_STATUS_SIZE = 1,
+  REPLY_DATA_OFFSET = REPLY_STATUS_OFFSET + REPLY_STATUS_SIZE,
+  REPLY_BCC_SIZE = 1,
+  REPLY_TRAILER_SIZE = 1,
+  STATUS_DATA_SIZE = 1,
+  STATUS_REPLY_MAX_SIZE = REPLY_DATA_OFFSET + STATUS_DATA_SIZE + REPLY_BCC_SIZE + REPLY_TRAILER_SIZE,
+  NORMAL_STATUS_NOT_READY = 0x00,
+  NORMAL_STATUS_READY = 0x01,
+  EXTENDED_STATUS_READY = 0x05,
+  EXTENDED_STATUS_NOT_READY = 0x06
+};
+
+G_STATIC_ASSERT(FT9362_RAW_FRAME_SIZE == REPLY_DATA_OFFSET + IMAGE_DATA_SIZE + REPLY_BCC_SIZE + REPLY_TRAILER_SIZE);
+
 static const guint8 finger_status_command[] = {0x02, 0x00, 0x03, 0x80, 0x02, 0x01, 0x80};
 static const guint8 capture_command[] = {0x02, 0x00, 0x01, 0x81, 0x80};
+static const guint8 extended_status_command[] = {0x02, 0x00, 0x03, 0x82, 0x73, 0x01, 0xf3};
+static const guint8 extended_capture_command[] = {0x02, 0x00, 0x03, 0x82, 0x76, 0x01, 0xf6};
 
 static const FpIdEntry supported_devices[] = {
     {.vid = USB_VENDOR_ID, .pid = USB_PRODUCT_ID},
@@ -36,6 +58,10 @@ static const FpIdEntry supported_devices[] = {
 typedef enum {
   CAPTURE_SEND_POLL,
   CAPTURE_READ_STATUS,
+  CAPTURE_SEND_EXTENDED_POLL,
+  CAPTURE_READ_EXTENDED_STATUS,
+  CAPTURE_SEND_EXTENDED_COMMAND,
+  CAPTURE_READ_EXTENDED_FRAME,
   CAPTURE_WAIT_POLL,
   CAPTURE_SEND_COMMAND,
   CAPTURE_READ_FRAME,
@@ -45,6 +71,7 @@ typedef enum {
 typedef struct {
   guint8 frame[FT9362_RAW_FRAME_SIZE];
   gsize bytes_received;
+  gint64 reply_deadline_us;
   FpiSsm* machine;
   gboolean transfer_pending;
 } Ft9362CaptureState;
@@ -58,13 +85,13 @@ G_DECLARE_FINAL_TYPE(FpiDeviceFocaltech0752, fpi_device_focaltech0752, FPI, DEVI
 G_DEFINE_TYPE(FpiDeviceFocaltech0752, fpi_device_focaltech0752, FP_TYPE_DEVICE);
 
 static void on_command_written(FpiUsbTransfer* transfer, FpDevice* dev, gpointer user_data, GError* error);
-static void on_finger_status_received(FpiUsbTransfer* transfer, FpDevice* dev, gpointer user_data, GError* error);
-static void on_frame_received(FpiUsbTransfer* transfer, FpDevice* dev, gpointer user_data, GError* error);
+static void on_reply_received(FpiUsbTransfer* transfer, FpDevice* dev, gpointer user_data, GError* error);
 
 static void capture_reset(FpDevice* dev) {
   Ft9362CaptureState* capture = &FPI_DEVICE_FOCALTECH0752(dev)->capture;
   memset(capture->frame, 0, sizeof(capture->frame));
   capture->bytes_received = 0;
+  capture->reply_deadline_us = 0;
 }
 
 static void capture_cleanup(FpDevice* dev) {
@@ -259,10 +286,21 @@ static void usb_write_command(FpDevice* dev, const guint8* command, gsize size, 
   usb_submit(transfer, COMMAND_TIMEOUT_MS, callback);
 }
 
-static void usb_read_reply(FpDevice* dev, gsize capacity, guint timeout_ms, FpiUsbTransferCallback callback) {
+static void usb_read_reply(FpDevice* dev) {
+  Ft9362CaptureState* capture = &FPI_DEVICE_FOCALTECH0752(dev)->capture;
+  Ft9362CapturePhase phase = fpi_ssm_get_cur_state(capture->machine);
+  gboolean image = phase == CAPTURE_READ_FRAME || phase == CAPTURE_READ_EXTENDED_FRAME;
+  gsize maximum = image ? FT9362_RAW_FRAME_SIZE : STATUS_REPLY_MAX_SIZE;
+  gint64 remaining_us = capture->reply_deadline_us - g_get_monotonic_time();
+  if (remaining_us <= 0) {
+    fpi_ssm_mark_failed(capture->machine, g_error_new_literal(G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT, "USB response deadline expired"));
+    return;
+  }
+
+  gsize capacity = ((maximum - capture->bytes_received + USB_PACKET_SIZE - 1) / USB_PACKET_SIZE) * USB_PACKET_SIZE;
   FpiUsbTransfer* transfer = fpi_usb_transfer_new(dev);
   fpi_usb_transfer_fill_bulk(transfer, USB_ENDPOINT_IN, capacity);
-  usb_submit(transfer, timeout_ms, callback);
+  usb_submit(transfer, (remaining_us + G_TIME_SPAN_MILLISECOND - 1) / G_TIME_SPAN_MILLISECOND, on_reply_received);
 }
 
 static gboolean capture_handle_transfer_result(FpiUsbTransfer* transfer, GError* error) {
@@ -292,16 +330,22 @@ static void capture_run_state(FpiSsm* machine, FpDevice* dev) {
       usb_write_command(dev, finger_status_command, sizeof(finger_status_command), on_command_written);
       break;
     case CAPTURE_READ_STATUS:
-      usb_read_reply(dev, STATUS_REPLY_CAPACITY, COMMAND_TIMEOUT_MS, on_finger_status_received);
+    case CAPTURE_READ_EXTENDED_STATUS:
+    case CAPTURE_READ_EXTENDED_FRAME:
+    case CAPTURE_READ_FRAME:
+      usb_read_reply(dev);
+      break;
+    case CAPTURE_SEND_EXTENDED_POLL:
+      usb_write_command(dev, extended_status_command, sizeof(extended_status_command), on_command_written);
+      break;
+    case CAPTURE_SEND_EXTENDED_COMMAND:
+      usb_write_command(dev, extended_capture_command, sizeof(extended_capture_command), on_command_written);
       break;
     case CAPTURE_WAIT_POLL:
       fpi_ssm_jump_to_state_delayed(machine, CAPTURE_SEND_POLL, FINGER_POLL_INTERVAL_MS);
       break;
     case CAPTURE_SEND_COMMAND:
       usb_write_command(dev, capture_command, sizeof(capture_command), on_command_written);
-      break;
-    case CAPTURE_READ_FRAME:
-      usb_read_reply(dev, FT9362_RAW_FRAME_SIZE, FRAME_TIMEOUT_MS, on_frame_received);
       break;
     case CAPTURE_NUM_STATES:
     default:
@@ -313,48 +357,96 @@ static void on_command_written(FpiUsbTransfer* transfer, FpDevice* dev, gpointer
   if (!capture_handle_transfer_result(transfer, error)) {
     return;
   }
+  Ft9362CaptureState* capture = &FPI_DEVICE_FOCALTECH0752(dev)->capture;
+  Ft9362CapturePhase phase = fpi_ssm_get_cur_state(transfer->ssm);
+  gboolean image = phase == CAPTURE_SEND_COMMAND || phase == CAPTURE_SEND_EXTENDED_COMMAND;
+  capture_reset(dev);
+  capture->reply_deadline_us = g_get_monotonic_time() + (image ? FRAME_TIMEOUT_MS : COMMAND_TIMEOUT_MS) * G_TIME_SPAN_MILLISECOND;
   fpi_ssm_next_state(transfer->ssm);
 }
 
-static void on_finger_status_received(FpiUsbTransfer* transfer, FpDevice* dev, gpointer user_data, GError* error) {
-  if (!capture_handle_transfer_result(transfer, error)) {
-    return;
+static GError* reply_validate(const guint8* reply, gsize size, gsize data_size) {
+  gsize content_size = ((gsize)reply[REPLY_LENGTH_OFFSET] << 8) | reply[REPLY_LENGTH_OFFSET + 1];
+  gsize logical_size = content_size + REPLY_HEADER_SIZE + REPLY_BCC_SIZE;
+  if (size > logical_size + REPLY_TRAILER_SIZE) {
+    return fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Unexpected bytes after USB response");
   }
-  if (transfer->actual_length < STATUS_REPLY_MIN_SIZE || transfer->actual_length > transfer->length) {
-    fpi_ssm_mark_failed(transfer->ssm, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Invalid status response length"));
-    return;
+  guint8 checksum = 0;
+  for (gsize i = REPLY_LENGTH_OFFSET; i < logical_size; i++) {
+    checksum ^= reply[i];
   }
-  if (transfer->buffer[0] != 0x02 || transfer->buffer[3] != 0x04) {
-    fpi_ssm_mark_failed(transfer->ssm, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Unexpected status response header or type"));
-    return;
+  if (checksum != 0) {
+    return fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "USB response BCC mismatch");
   }
-
-  if (transfer->buffer[4] == 0x01) {
-    fpi_device_report_finger_status(dev, FP_FINGER_STATUS_PRESENT);
-    fpi_ssm_jump_to_state(transfer->ssm, CAPTURE_SEND_COMMAND);
-    return;
+  if (reply[REPLY_STATUS_OFFSET] != REPLY_SUCCESS) {
+    return fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Device rejected command (status 0x%02x)", reply[REPLY_STATUS_OFFSET]);
   }
-  fpi_ssm_jump_to_state(transfer->ssm, CAPTURE_WAIT_POLL);
+  if (content_size != data_size + REPLY_STATUS_SIZE) {
+    return fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Unexpected USB response data length: %zu", content_size - REPLY_STATUS_SIZE);
+  }
+  return NULL;
 }
 
-static void on_frame_received(FpiUsbTransfer* transfer, FpDevice* dev, gpointer user_data, GError* error) {
+static void on_reply_received(FpiUsbTransfer* transfer, FpDevice* dev, gpointer user_data, GError* error) {
   Ft9362CaptureState* capture = &FPI_DEVICE_FOCALTECH0752(dev)->capture;
   if (!capture_handle_transfer_result(transfer, error)) {
     return;
   }
 
-  gsize remaining = sizeof(capture->frame) - capture->bytes_received;
-  if (transfer->actual_length <= 0 || (gsize)transfer->actual_length > remaining) {
-    fpi_ssm_mark_failed(transfer->ssm, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Invalid raw frame chunk length"));
+  Ft9362CapturePhase phase = fpi_ssm_get_cur_state(transfer->ssm);
+  gboolean image = phase == CAPTURE_READ_FRAME || phase == CAPTURE_READ_EXTENDED_FRAME;
+  gsize data_size = image ? IMAGE_DATA_SIZE : STATUS_DATA_SIZE;
+  gsize maximum = REPLY_DATA_OFFSET + data_size + REPLY_BCC_SIZE + REPLY_TRAILER_SIZE;
+  if (transfer->actual_length <= 0 || transfer->actual_length > transfer->length || (gsize)transfer->actual_length > maximum - capture->bytes_received) {
+    fpi_ssm_mark_failed(transfer->ssm, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Invalid USB response chunk length"));
     return;
   }
   memcpy(capture->frame + capture->bytes_received, transfer->buffer, transfer->actual_length);
   capture->bytes_received += transfer->actual_length;
-  if (capture->bytes_received == sizeof(capture->frame)) {
-    fpi_ssm_mark_completed(transfer->ssm);
+  if (capture->frame[0] != REPLY_START_BYTE) {
+    fpi_ssm_mark_failed(transfer->ssm, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Invalid USB response header"));
     return;
   }
-  fpi_ssm_jump_to_state(transfer->ssm, CAPTURE_READ_FRAME);
+  if (capture->bytes_received < REPLY_HEADER_SIZE) {
+    usb_read_reply(dev);
+    return;
+  }
+
+  gsize content_size = ((gsize)capture->frame[REPLY_LENGTH_OFFSET] << 8) | capture->frame[REPLY_LENGTH_OFFSET + 1];
+  if (content_size < REPLY_STATUS_SIZE || content_size > data_size + REPLY_STATUS_SIZE) {
+    fpi_ssm_mark_failed(transfer->ssm, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Invalid USB response content length: %zu", content_size));
+    return;
+  }
+  if (capture->bytes_received < content_size + REPLY_HEADER_SIZE + REPLY_BCC_SIZE) {
+    usb_read_reply(dev);
+    return;
+  }
+  error = reply_validate(capture->frame, capture->bytes_received, data_size);
+  if (error != NULL) {
+    fpi_ssm_mark_failed(transfer->ssm, error);
+    return;
+  }
+
+  if (phase == CAPTURE_READ_FRAME) {
+    if (capture->bytes_received != FT9362_RAW_FRAME_SIZE) {
+      fpi_ssm_mark_failed(transfer->ssm, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Image response is incompatible with FT9362-RAW-v1"));
+      return;
+    }
+    fpi_ssm_mark_completed(transfer->ssm);
+  } else if (phase == CAPTURE_READ_EXTENDED_FRAME) {
+    fpi_ssm_jump_to_state(transfer->ssm, CAPTURE_SEND_POLL);
+  } else if (phase == CAPTURE_READ_STATUS && capture->frame[REPLY_DATA_OFFSET] == NORMAL_STATUS_READY) {
+    fpi_device_report_finger_status(dev, FP_FINGER_STATUS_PRESENT);
+    fpi_ssm_jump_to_state(transfer->ssm, CAPTURE_SEND_COMMAND);
+  } else if (phase == CAPTURE_READ_STATUS && capture->frame[REPLY_DATA_OFFSET] == NORMAL_STATUS_NOT_READY) {
+    fpi_ssm_jump_to_state(transfer->ssm, CAPTURE_SEND_EXTENDED_POLL);
+  } else if (phase == CAPTURE_READ_EXTENDED_STATUS && capture->frame[REPLY_DATA_OFFSET] == EXTENDED_STATUS_READY) {
+    fpi_ssm_jump_to_state(transfer->ssm, CAPTURE_SEND_EXTENDED_COMMAND);
+  } else if (phase == CAPTURE_READ_EXTENDED_STATUS && capture->frame[REPLY_DATA_OFFSET] == EXTENDED_STATUS_NOT_READY) {
+    fpi_ssm_jump_to_state(transfer->ssm, CAPTURE_WAIT_POLL);
+  } else {
+    fpi_ssm_mark_failed(transfer->ssm, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Unexpected capture status 0x%02x in phase %d", capture->frame[REPLY_DATA_OFFSET], phase));
+  }
 }
 
 static void capture_done(FpiSsm* machine, FpDevice* dev, GError* error) {

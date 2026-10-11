@@ -34,7 +34,8 @@ class DeviceTestWindow(Gtk.Window):
         self.scope = Gtk.ComboBoxText()
         for key, label in (("full", "完整复现：无手指 + 动作 + 通道对照（共按压 3 次）"),
                            ("no_finger", "仅无手指测试"), ("movement", "仅手指动作（按压 2 次）"),
-                           ("comparison", "仅通道对照（按压 1 次）")):
+                           ("comparison", "仅通道对照（按压 1 次）"),
+                           ("validation", "综合协议验证：一次执行全部阶段（约 5–10 分钟）")):
             self.scope.append(key, label)
         self.scope.set_active_id(scope)
         self.scope.connect("changed", lambda _: self.refresh())
@@ -201,7 +202,7 @@ class DeviceTestWindow(Gtk.Window):
     def show_frame(self, raw, phase, index, count):
         if self.closing:
             return False
-        if len(raw) == 12166:
+        if raw is not None and len(raw) == 12166:
             width, height, pixels = decode_preview(raw)
             rgb = bytes(channel for pixel in pixels for channel in (pixel, pixel, pixel))
             pixbuf = GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(rgb), GdkPixbuf.Colorspace.RGB,
@@ -210,7 +211,11 @@ class DeviceTestWindow(Gtk.Window):
         names = {"normal_before": "A：只读普通帧", "status_only": "B：加入扩展状态",
                  "with_extended": "C：加入扩展取图", "normal_after": "D：回到普通帧"}
         self.progress.set_fraction(index / count)
-        self.status.set_text(f"{names.get(phase, phase)} · {index}/{count} 帧\n保持当前动作，等下一步提示。")
+        if raw is None:
+            self.status.set_text(f"{phase}\n自动执行中，请按上述动作提示操作，无需点击下一步。")
+            self.prompt.set_text(phase)
+        else:
+            self.status.set_text(f"{names.get(phase, phase)} · {index}/{count} 帧\n保持当前动作，等下一步提示。")
         return False
 
     def finished(self, error):
