@@ -98,6 +98,7 @@ static Ft9362Status fake_enroll(const Ft9362Frame* frame, Ft9362Template* output
 
 static Ft9362Status fake_verify(const Ft9362Frame* frame, const Ft9362TemplateView* reference, Ft9362VerifyResult* output) {
   algorithm_calls++;
+  g_assert_cmpmem(frame->data, frame->size, expected, sizeof(expected));
   Ft9362Status status = ft9362_verify(frame, reference, output);
   if (status == FT9362_STATUS_OK && scenario == VERIFY_NO_MATCH) {
     g_assert_cmpstr(reference->format, ==, "reference-v1");
@@ -113,6 +114,7 @@ static Ft9362Status fake_verify(const Ft9362Frame* frame, const Ft9362TemplateVi
 
 static Ft9362Status fake_identify(const Ft9362Frame* frame, const Ft9362TemplateView* gallery, size_t gallery_size, Ft9362IdentifyResult* output) {
   algorithm_calls++;
+  g_assert_cmpmem(frame->data, frame->size, expected, sizeof(expected));
   Ft9362Status status = ft9362_identify(frame, gallery, gallery_size, output);
   if (status == FT9362_STATUS_OK && scenario == IDENTIFY_SECOND) {
     g_assert_cmpuint(gallery_size, ==, 2);
@@ -423,7 +425,7 @@ static void test_verify(void) {
   g_assert_no_error(error);
   g_assert_true(matched);
   g_assert_cmpuint(captures, ==, 1);
-  assert_raw(scanned);
+  g_assert_null(scanned);
   close_device(dev);
 }
 
@@ -443,7 +445,30 @@ static void test_identify(void) {
   g_assert_true(fp_device_identify_sync(dev, gallery, NULL, NULL, NULL, &match, &scanned, &error));
   g_assert_no_error(error);
   g_assert_true(match == g_ptr_array_index(gallery, 0));
+  g_assert_null(scanned);
+  close_device(dev);
+}
+
+static void test_matching_scan(gconstpointer data) {
+  FpDevice* dev = new_device(NORMAL);
+  g_autoptr(GError) error = NULL;
+  g_autoptr(FpPrint) reference = fp_device_enroll_sync(dev, fp_print_new(dev), NULL, NULL, NULL, &error);
+  g_autoptr(FpPrint) scanned = NULL;
+  g_assert_no_error(error);
+  if (GPOINTER_TO_INT(data) == FPI_DEVICE_ACTION_VERIFY) {
+    gboolean matched = FALSE;
+    g_assert_true(fp_device_verify_sync(dev, reference, NULL, NULL, NULL, &matched, &scanned, &error));
+    g_assert_true(matched);
+  } else {
+    g_autoptr(GPtrArray) gallery = g_ptr_array_new_with_free_func(g_object_unref);
+    g_autoptr(FpPrint) match = NULL;
+    g_ptr_array_add(gallery, g_object_ref(reference));
+    g_assert_true(fp_device_identify_sync(dev, gallery, NULL, NULL, NULL, &match, &scanned, &error));
+    g_assert_true(match == reference);
+  }
+  g_assert_no_error(error);
   assert_raw(scanned);
+  g_assert_true(fp_print_equal(scanned, reference));
   close_device(dev);
 }
 
@@ -533,7 +558,7 @@ static void test_usb_error_and_restart(gconstpointer data) {
   g_assert_true(fp_device_verify_sync(dev, reference, NULL, NULL, NULL, &matched, &scanned, &error));
   g_assert_no_error(error);
   g_assert_true(matched);
-  assert_raw(scanned);
+  g_assert_null(scanned);
   g_assert_cmpuint(usb_failures, ==, 1);
   g_assert_cmpuint(action_completions, ==, 2);
   g_assert_cmpuint(algorithm_calls, ==, 1);
@@ -578,7 +603,7 @@ static void test_cancel_and_restart(gconstpointer data) {
   g_assert_true(fp_device_verify_sync(dev, reference, NULL, NULL, NULL, &matched, &scanned, &error));
   g_assert_no_error(error);
   g_assert_true(matched);
-  assert_raw(scanned);
+  g_assert_null(scanned);
   g_assert_cmpuint(captures, ==, test_scenario == CANCEL_TIMER ? 1 : 2);
   g_assert_cmpuint(algorithm_calls, ==, 1);
   g_assert_cmpuint(action_completions, ==, 2);
@@ -658,10 +683,11 @@ static void test_algorithm_identify(gconstpointer data) {
     g_assert_no_error(error);
     if (test_scenario == IDENTIFY_SECOND) {
       g_assert_true(match == g_ptr_array_index(gallery, 1));
+      g_assert_null(scanned);
     } else {
       g_assert_null(match);
+      assert_raw(scanned);
     }
-    assert_raw(scanned);
   }
   close_device(dev);
 }
@@ -673,6 +699,8 @@ int main(int argc, char** argv) {
   g_test_add_func("/focaltech-raw/enroll-roundtrip", test_enroll);
   g_test_add_func("/focaltech-raw/verify-bypass", test_verify);
   g_test_add_func("/focaltech-raw/identify", test_identify);
+  g_test_add_data_func("/focaltech-raw/verify-matching-scan", GINT_TO_POINTER(FPI_DEVICE_ACTION_VERIFY), test_matching_scan);
+  g_test_add_data_func("/focaltech-raw/identify-matching-scan", GINT_TO_POINTER(FPI_DEVICE_ACTION_IDENTIFY), test_matching_scan);
   g_test_add_data_func("/focaltech-raw/empty-frame", GINT_TO_POINTER(EMPTY_FRAME), test_failure);
   g_test_add_data_func("/focaltech-raw/oversized-frame", GINT_TO_POINTER(OVERSIZED_FRAME), test_failure);
   g_test_add_data_func("/focaltech-raw/usb-error", GINT_TO_POINTER(USB_ERROR), test_usb_error_and_restart);

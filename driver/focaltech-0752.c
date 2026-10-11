@@ -185,6 +185,9 @@ static void process_verification(FpDevice* dev, const Ft9362Frame* frame) {
   }
 
   g_autoptr(FpPrint) print = print_from_template(dev, &scanned);
+  if (output.matched && print != NULL && (fpi_print_get_type(reference) != FPI_PRINT_RAW || reference_data == NULL || !fp_print_equal(print, reference))) {
+    g_clear_object(&print);
+  }
   capture_cleanup(dev);
   fpi_device_verify_report(dev, output.matched ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL, print, NULL);
   fpi_device_verify_complete(dev, NULL);
@@ -218,6 +221,9 @@ static void process_identification(FpDevice* dev, const Ft9362Frame* frame) {
 
   FpPrint* match = output.matched_index == FT9362_NO_MATCH ? NULL : g_ptr_array_index(prints, output.matched_index);
   g_autoptr(FpPrint) print = print_from_template(dev, &scanned);
+  if (match != NULL && print != NULL && (fpi_print_get_type(match) != FPI_PRINT_RAW || gallery[output.matched_index].data == NULL || !fp_print_equal(print, match))) {
+    g_clear_object(&print);
+  }
   capture_cleanup(dev);
   fpi_device_identify_report(dev, match, print, NULL);
   fpi_device_identify_complete(dev, NULL);

@@ -48,11 +48,11 @@ INF 的 `DriverVer` 是 `10/28/2024,5.2.69.24`；主 DLL 内部版本初始化�
 
 本文所有 `M:` 地址指主 DLL 的 RVA，首选 ImageBase=`0x180000000`；`E:` 指引擎 DLL RVA；`S:` 指服务 EXE RVA，其首选 ImageBase=`0x140000000`。RVA 不是文件偏移。函数名主要恢复自日志及调用关系，不代表导出符号。
 
-Linux 对照快照（2026-10-11，算法入口更名并改为共享库，USB 与占位算法行为不变）：
+Linux 对照快照（2026-10-11，已适配 libfprint 1.94.100；USB 流程与占位匹配结论不变）：
 
 | 源文件 | SHA-256 |
 | --- | --- |
-| [focaltech-0752.c](../driver/focaltech-0752.c) | `ab3a7f7b630f2f4940164792dc871697019aeea3bf56d73d839bc08abb733046` |
+| [focaltech-0752.c](../driver/focaltech-0752.c) | `3cc211311ce0391dbae3e9b9b3dc1ea71ffd47f6f020f92bb5c6823b3f11a270` |
 | [entry.h](../driver/algorithm/entry.h) | `b4b69a088f7189a8bac1c19c683309e8dd86ed3774e7529ae07313c8349e1535` |
 | [entry.cpp](../driver/algorithm/entry.cpp) | `02155cc16258e6d037f985566d8b83a34a404cc78a9cd9e96797e1524191020e` |
 
@@ -98,7 +98,7 @@ Python / libfprint API
 | 诊断 | 版本、尺寸、两个 UID、升级计数、主密钥状态、原始透传等 | 无 | 多数适合独立诊断工具，不必塞进认证流程 |
 | 服务 | 包内含设备管理辅助服务，其中重启过滤器针对 C652 | 无 | 不作为 0752 缺失能力照搬 |
 
-Linux C++ 后端仍是开发占位：完整采集后 verify 报成功，identify 在非空 gallery 中选首项。本文不将该行为当作 Windows 匹配的等价实现，也不展开 Windows 匹配算法内部细节。
+Linux C++ 后端仍是开发占位：完整采集后 verify 报成功，identify 在非空 gallery 中选首项。适配 libfprint 1.94.100 后，匹配成功时若新扫描模板与参考模板不相等，C 适配层省略可选的扫描模板；录入仍返回完整原始帧。本文不将该行为当作 Windows 匹配的等价实现，也不展开 Windows 匹配算法内部细节。
 
 ## 3. USB 传输层
 
