@@ -188,6 +188,9 @@ class TestSession:
         self.terminal = True
         error = self.raw_dir / "error.json"
         self.last_error = json.loads(error.read_text()).get("error") if error.exists() else "上次测试失败"
+        validation = self.raw_dir / "validation" / "report.json"
+        if summary["scope"] == "validation" and validation.exists():
+            self.last_error = json.loads(validation.read_text()).get("error") or self.last_error
         return self
 
     @property
@@ -195,6 +198,42 @@ class TestSession:
         return (self.terminal and self.summary["status"] == "failed"
                 and self.summary.get("valid_for_analysis") and self.index < len(self.steps)
                 and self.summary["steps"][self.index]["status"] == "failed")
+
+    @property
+    def can_resume_validation(self):
+        if not self.can_recover or self.summary["scope"] != "validation":
+            return False
+        from device_validation import resume_state
+        try:
+            resume_state(self.raw_dir / "validation" / "report.json")
+        except (ValueError, OSError, KeyError, TypeError):
+            return False
+        return True
+
+    def resume_validation(self):
+        if not self.can_resume_validation:
+            raise ValueError("当前轮次没有可以安全续测的取消矩阵")
+        row = self.summary["steps"][self.index]
+        self.stop.clear()
+        self.last_error = None
+        self.terminal = False
+        self.summary.update(status="running", completed=False)
+        self.summary.pop("finished_utc", None)
+        row["status"] = "running"
+        try:
+            self.save()
+            self.run_validation(row, resume=True)
+            self.index += 1
+            self.complete_if_done()
+        except Exception as error:
+            self.last_error = str(error)
+            # Keep a stopped continuation resumable; evidence remains incomplete.
+            row.update(status="failed", note="续测暂停，原用例和等待恢复记录均已保留。")
+            self.summary.update(status="failed", completed=False, finished_utc=utc())
+            self.terminal = True
+        finally:
+            row["finished_utc"] = utc()
+            self.save()
 
     def complete_if_done(self):
         if self.index == len(self.steps):
@@ -382,15 +421,17 @@ class TestSession:
             row["finished_utc"] = utc()
             self.save()
 
-    def run_validation(self, row):
+    def run_validation(self, row, resume=False):
         from device_validation import public_summary
         directory = self.raw_dir / "validation"
-        directory.mkdir(mode=0o700)
+        directory.mkdir(mode=0o700, exist_ok=resume)
         path = directory / "report.json"
-        with (directory / "worker.log").open("x", encoding="utf-8") as log:
+        logfile = "worker-resume-" + uuid.uuid4().hex + ".log" if resume else "worker.log"
+        with (directory / logfile).open("x", encoding="utf-8") as log:
             os.chmod(log.name, 0o600)
             process = subprocess.Popen([sys.executable, str(Path(__file__).with_name("device_validation.py")),
-                                        "--report", str(path)], stdout=log, stderr=subprocess.STDOUT)
+                                        "--report", str(path)] + (["--resume-matrix"] if resume else []),
+                                       stdout=log, stderr=subprocess.STDOUT)
             deadline = time.monotonic() + 1200
             last_update = time.monotonic()
             previous = None
@@ -420,7 +461,8 @@ class TestSession:
                 report = json.loads(path.read_text())
                 row["validation"] = public_summary(report)
             if interrupted or process.returncode or not path.exists() or not report.get("completed"):
-                raise ProbeError("综合验证未完成；已保留阶段报告，详见 private/validation。")
+                detail = report.get("error") if path.exists() else None
+                raise ProbeError("综合验证未完成；" + (detail or "已保留阶段报告，详见 private/validation。"))
             row["status"] = "observed"
             row["note"] = "完整执行；取消未命中、恢复失败、阻断项和未验证能力分别记录，不等于全部通过。"
 

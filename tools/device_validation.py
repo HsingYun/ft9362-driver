@@ -21,6 +21,7 @@ from pathlib import Path
 import signal
 import threading
 import time
+import uuid
 
 from device_capabilities import Experiment, INFO, command
 from probe_device import (USB, Query, ProbeError, decode_response, encode_request,
@@ -551,7 +552,170 @@ def public_summary(report):
                                                       "status_before", "extended_status") if k in row})
     if "baseline" in report:
         result["baseline"] = report["baseline"]
+    result["continuations"] = [
+        {**{k: row[k] for k in ("started_unix_ns", "finished_unix_ns", "from_case", "status") if k in row},
+         "recovery_checks": [{k: check[k] for k in ("wait_s", "status", "started_unix_ns", "finished_unix_ns") if k in check}
+                             for check in row.get("recovery_checks", [])]}
+        for row in report.get("continuations", [])]
     return result
+
+
+def resume_state(path):
+    """Validate the saved matrix prefix without mutating evidence or opening USB."""
+    report = json.loads(path.read_text())
+    rows = report.get("cases", [])
+    if (report.get("schema_version") != 2 or report.get("experiment") != "protocol_validation"
+            or report.get("completed") or report.get("valid_for_analysis") is False
+            or not report.get("baseline", {}).get("completed") or not 0 < len(rows) <= len(CASES)):
+        raise ValueError("仅支持已进入取消矩阵、未完成且有效的版本 2 报告续测")
+    selected_path = None
+    for index, row in enumerate(rows):
+        case, strategy = CASES[index]
+        if (row.get("case"), row.get("strategy")) != (case.name, strategy) or row.get("status") == "running":
+            raise ValueError("已保存用例与当前矩阵顺序不一致，不能续测")
+        evidence = json.loads((path.parent / f"case-{index + 1:02d}-{case.name}-{strategy}.json").read_text())
+        port = evidence.get("expected_path")
+        if not port or evidence.get("result") != row or (selected_path and port != selected_path):
+            raise ValueError("用例记录或物理端口不一致，不能续测")
+        selected_path = port
+    # An interrupted worker may have saved a case without updating its index.
+    # Never overwrite or silently skip such evidence.
+    for index in range(len(rows), len(CASES)):
+        case, strategy = CASES[index]
+        if (path.parent / f"case-{index + 1:02d}-{case.name}-{strategy}.json").exists():
+            raise ValueError("存在未归入索引的用例记录，需先核对，不能覆盖续测")
+    return report, selected_path
+
+
+def run_matrix(path, report, selected_path, stop, progress):
+    for index in range(len(report["cases"]), len(CASES)):
+        if stop.is_set():
+            raise ProbeError("operator stopped")
+        case, strategy = CASES[index]
+        progress(f"保持接触：{index + 1}/{len(CASES)} · {case.name} / {STRATEGY_NAMES[strategy]}")
+        case_report = {"operations": [], "case": case.name, "strategy": strategy, "expected_path": selected_path}
+        case_path = path.parent / f"case-{index + 1:02d}-{case.name}-{strategy}.json"
+        with case_path.open("x"):
+            os.chmod(case_path, 0o600)
+        checkpoint = lambda: save(case_path, case_report)
+        checkpoint()
+        result = run_case(case, strategy, case_report, stop, checkpoint)
+        report["cases"].append(result)
+        save(path, report)
+        if (result["status"] in ("baseline_failed", "blocked", "cancelled")
+                or result.get("cleanup", {}).get("status") == "failed"):
+            raise ProbeError(f"第 {index + 1} 项停止：{result['status']}，清理 {result.get('cleanup', {}).get('status', 'unknown')}；需恢复通信后续测")
+
+
+def wait_for_recovery(directory, selected_path, stop, progress, record, checkpoint,
+                      factory=None, delays=(2, 5, 15, 30)):
+    """Wait with USB closed, then reopen and probe; deliberately no reset/drain."""
+    factory = factory or CancelExperiment
+    for attempt, delay in enumerate(delays):
+        check = {"wait_s": delay, "status": "waiting", "started_unix_ns": time.time_ns()}
+        record.setdefault("recovery_checks", []).append(check)
+        checkpoint()
+        for remaining in range(delay, 0, -1):
+            progress(f"请保持抬手：第 {attempt + 1}/{len(delays)} 次恢复检查，关闭接口等待，剩余 {remaining} 秒。")
+            if stop.wait(1):
+                check.update(status="cancelled", finished_unix_ns=time.time_ns())
+                checkpoint()
+                raise ProbeError("operator stopped recovery wait")
+        if stop.is_set():
+            raise ProbeError("operator stopped recovery")
+        raw = {"operations": [], "expected_path": selected_path, "started_unix_ns": time.time_ns()}
+        raw_path = directory / f"check-{attempt + 1}.json"
+        save(raw_path, raw)
+        ex = factory(raw, stop, lambda: save(raw_path, raw))
+        close_failed = False
+        try:
+            progress(f"请保持抬手：第 {attempt + 1}/{len(delays)} 次同端口重开、桥接与应用健康检查。")
+            ex.open()
+            ex.probe_bridge("wait_recovery/probe")
+            ex.health("wait_recovery/health")
+            check["status"] = "passed"
+        except Exception as error:
+            raw["error"] = str(error)
+            check["status"] = "cancelled" if stop.is_set() else "failed"
+        finally:
+            try:
+                ex.close()
+            except Exception as error:
+                raw["close_error"] = str(error)
+                close_failed = True
+                check["status"] = "failed"
+            check["finished_unix_ns"] = raw["finished_unix_ns"] = time.time_ns()
+            save(raw_path, raw)
+            checkpoint()
+        if close_failed or stop.is_set():
+            raise ProbeError("恢复检查已停止或接口释放失败")
+        if check["status"] == "passed":
+            return
+    raise ProbeError("等待和重开检查均未恢复通信，未执行后续用例；可稍后再次续测")
+
+
+def resume_suite(path, stop):
+    report, selected_path = resume_state(path)
+    directory = path.parent / ("continuation-" + uuid.uuid4().hex)
+    directory.mkdir(mode=0o700)
+    save(directory / "before.json", report)
+    record = {"started_unix_ns": time.time_ns(), "from_case": len(report["cases"]) + 1,
+              "status": "running", "recovery_checks": []}
+    report.setdefault("continuations", []).append(record)
+    report.pop("error", None)
+    report.pop("close_error", None)
+    report.pop("finished_unix_ns", None)
+    def checkpoint():
+        save(path, report)
+    def progress(message):
+        report["progress"] = {"message": message, "completed": len(report["cases"]), "total": len(CASES),
+                              "updated_ns": time.monotonic_ns()}
+        checkpoint()
+    ex = None
+    try:
+        checkpoint()
+        wait_for_recovery(directory, selected_path, stop, progress, record, checkpoint)
+        gate = {"operations": [], "expected_path": selected_path}
+        ex = CancelExperiment(gate, stop, lambda: save(directory / "contact.json", gate))
+        ex.open()
+        progress("通信检查通过。现在完全抬手，正在确认续测起点。")
+        ex.wait_contact(False, 60)
+        if len(report["cases"]) < len(CASES):
+            progress(f"现在放上同一根手指并保持接触；从第 {len(report['cases']) + 1}/50 项继续，已有结果保留。")
+            ex.wait_contact(True, 60)
+        ex.close()
+        save(directory / "contact.json", gate)
+        run_matrix(path, report, selected_path, stop, progress)
+        progress("全部组合已执行。现在完全抬手，进行最终恢复检查。")
+        final = {"operations": [], "expected_path": selected_path}
+        ex = CancelExperiment(final, stop, lambda: save(directory / "final.json", final))
+        ex.open()
+        try:
+            ex.establish_baseline("final")
+            ex.wait_contact(False, 60)
+        finally:
+            ex.close()
+            save(directory / "final.json", final)
+        report["completed"] = True
+        record["status"] = "completed"
+        progress("综合验证已完成。请保持抬手；历史失败仍保留在报告中。")
+    except Exception as error:
+        report["error"] = str(error)
+        record["status"] = "cancelled" if stop.is_set() else "failed"
+        report["completed"] = False
+    finally:
+        if ex is not None:
+            try:
+                ex.close()
+                ex.checkpoint()
+            except Exception as error:
+                report["close_error"] = str(error)
+                report["completed"] = False
+                record["status"] = "failed"
+        report["finished_unix_ns"] = record["finished_unix_ns"] = time.time_ns()
+        report["unattempted_cases"] = [{"case": c.name, "strategy": s} for c, s in CASES[len(report["cases"]):]]
+        checkpoint()
+    return report
 
 
 def run_suite(path, stop):
@@ -657,20 +821,7 @@ def run_suite(path, stop):
         progress("再次放上同一根手指，保持接触；接下来自动执行所有取消/恢复组合。")
         ex.wait_contact(True, 60)
         ex.close()
-        for index, (case, strategy) in enumerate(CASES):
-            if stop.is_set():
-                raise ProbeError("operator stopped")
-            progress(f"保持接触：{index + 1}/{len(CASES)} · {case.name} / {STRATEGY_NAMES[strategy]}")
-            case_report = {"operations": [], "case": case.name, "strategy": strategy, "expected_path": selected_path}
-            case_path = path.parent / f"case-{index + 1:02d}-{case.name}-{strategy}.json"
-            checkpoint = lambda: save(case_path, case_report)
-            checkpoint()
-            result = run_case(case, strategy, case_report, stop, checkpoint)
-            report["cases"].append(result)
-            save(path, report)
-            if (result["status"] in ("baseline_failed", "blocked", "cancelled")
-                    or result.get("cleanup", {}).get("status") == "failed"):
-                raise ProbeError("cannot continue from failed baseline, contact gate, cleanup or operator stop")
+        run_matrix(path, report, selected_path, stop, progress)
         progress("全部组合已完成。现在抬起手指，正在进行最终恢复和检查。")
         final = {"operations": [], "expected_path": selected_path}
         ex = CancelExperiment(final, stop, lambda: save(path.parent / "final.json", final))
@@ -698,12 +849,13 @@ def run_suite(path, stop):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", required=True, type=Path)
+    parser.add_argument("--resume-matrix", action="store_true", help="wait for recovery and continue unattempted cases")
     args = parser.parse_args()
     os.umask(0o077)
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    report = run_suite(args.report, stop)
+    report = (resume_suite if args.resume_matrix else run_suite)(args.report, stop)
     return 0 if report["completed"] else 1
 
 

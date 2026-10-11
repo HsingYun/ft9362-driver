@@ -87,6 +87,9 @@ class DeviceTestWindow(Gtk.Window):
         self.skip_button = Gtk.Button(label="恢复 USB 后跳过此项")
         self.skip_button.connect("clicked", lambda _: self.recover_session("skip"))
         recovery.pack_start(self.skip_button, False, False, 0)
+        self.resume_button = Gtk.Button(label="等待恢复并续测剩余组合")
+        self.resume_button.connect("clicked", self.resume_validation)
+        recovery.pack_start(self.resume_button, False, False, 0)
         if resume_path is not None:
             self.load_failed(resume_path)
         self.refresh()
@@ -104,7 +107,11 @@ class DeviceTestWindow(Gtk.Window):
             session = self.session
             for row in session.summary["steps"]:
                 self.rows.append([row["title"], STATUS[row["status"]]])
-            if session.can_recover:
+            if session.can_resume_validation:
+                self.prompt.set_text("综合测试已暂停。请完全抬手，点击“等待恢复并续测剩余组合”。\n"
+                                     "依次关闭接口等待 2、5、15、30 秒并重开检查，不额外复位。检查通过后提示重新按压。\n"
+                                     "此前用例结果保持不变，从未执行组合继续；恢复失败仍暂停。")
+            elif session.can_recover:
                 step = session.steps[session.index]
                 self.prompt.set_text(f"第 {session.index + 1} 步失败：{step.title}\n"
                                      "请先完全抬手。可复位这一个 USB 设备并验证通信后重试，或保留失败结果并跳过。\n"
@@ -133,6 +140,10 @@ class DeviceTestWindow(Gtk.Window):
         finger = self.session is not None and self.session.index < len(self.session.steps) and self.session.steps[self.session.index].group != "no_finger"
         self.retry_button.set_label("恢复 USB 后重做本组" if finger else "恢复 USB 后重试")
         self.skip_button.set_label("恢复 USB 后跳过本组" if finger else "恢复 USB 后跳过此项")
+        if self.session is not None and self.session.summary["scope"] == "validation":
+            self.retry_button.set_label("复位并重做整轮")
+        self.resume_button.set_sensitive(bool(self.session is not None and not self.busy and not self.closing
+                                              and self.session.can_resume_validation))
 
     def load_failed(self, directory):
         self.session = TestSession.load_failed(directory,
@@ -161,6 +172,12 @@ class DeviceTestWindow(Gtk.Window):
             return
         self.worker(lambda: self.session.recover(action))
         self.status.set_text("正在复位指纹 USB 设备、重新打开并验证通信；请保持手指抬起……")
+
+    def resume_validation(self, *_):
+        if self.busy or self.closing or self.session is None or not self.session.can_resume_validation:
+            return
+        self.worker(self.session.resume_validation)
+        self.status.set_text("请保持抬手。正在等待恢复；随后按提示重新按压，自动续测剩余组合。")
 
     def worker(self, operation):
         self.busy = True

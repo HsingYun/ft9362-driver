@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from device_validation import (AsyncUSB, Transfer, CASES, CONTROLS, INTERRUPTIONS, STRATEGIES,
                                Case, NORMAL_FRAME, RESPONSE_CAPACITY, CancelExperiment, collect_frames,
                                injection_result, public_summary, residual_summary, run_case, run_suite)
+from device_validation import resume_state, resume_suite, wait_for_recovery
 from device_testing import TestSession, plan
 from probe_device import ProbeError, bcc
 
@@ -101,6 +102,158 @@ class QueuedUSB:
 
 
 class ValidationTest(unittest.TestCase):
+    def saved_matrix(self, root, count=20):
+        path = Path(root) / "report.json"
+        rows = []
+        for index, (case, strategy) in enumerate(CASES[:count]):
+            row = {"case": case.name, "strategy": strategy, "status": "recovery_failed",
+                   "cleanup": {"status": "failed"}}
+            rows.append(row)
+            (path.parent / f"case-{index + 1:02d}-{case.name}-{strategy}.json").write_text(json.dumps({
+                "expected_path": "/physical/port", "result": row, "operations": []}))
+        path.write_text(json.dumps({"schema_version": 2, "experiment": "protocol_validation",
+            "completed": False, "baseline": {"completed": True}, "cases": rows,
+            "sampling": [{"phase": "steady_stream", "frames": 178}], "error": "old failure"}))
+        return path
+
+    def test_resume_keeps_old_evidence_and_only_runs_remaining_cases(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.saved_matrix(root)
+            before = {p: p.read_bytes() for p in path.parent.glob('case-*.json')}
+            old = json.loads(path.read_text())
+            def case_result(case, strategy, raw, stop, checkpoint):
+                raw["result"] = {"case": case.name, "strategy": strategy, "status": "passed"}
+                checkpoint()
+                return raw["result"]
+            with patch("device_validation.wait_for_recovery") as wait, \
+                 patch("device_validation.CancelExperiment") as factory, \
+                 patch("device_validation.run_case", side_effect=case_result) as run, \
+                 patch("device_validation.collect_frames") as sampling:
+                result = resume_suite(path, threading.Event())
+            self.assertTrue(result['completed'], result.get('error'))
+            self.assertEqual(run.call_count, 30)
+            self.assertEqual(run.call_args_list[0].args[:2], CASES[20])
+            self.assertEqual(result['cases'][:20], old['cases'])
+            self.assertEqual(result['sampling'], old['sampling'])
+            self.assertEqual(result['unattempted_cases'], [])
+            self.assertEqual(result['continuations'][0]['from_case'], 21)
+            self.assertEqual(json.loads(next(path.parent.glob('continuation-*/before.json')).read_text()), old)
+            sampling.assert_not_called()
+            wait.assert_called_once()
+            for p, content in before.items():
+                self.assertEqual(p.read_bytes(), content)
+
+    def test_failed_wait_never_runs_cases_and_remains_resumable(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.saved_matrix(root)
+            with patch("device_validation.wait_for_recovery", side_effect=ProbeError("still unresponsive")), \
+                 patch("device_validation.run_case") as run:
+                result = resume_suite(path, threading.Event())
+            self.assertFalse(result['completed'])
+            self.assertEqual(len(result['cases']), 20)
+            self.assertEqual(len(result['unattempted_cases']), 30)
+            run.assert_not_called()
+            self.assertEqual(resume_state(path)[1], '/physical/port')
+
+    def test_resumed_cleanup_failure_stops_again_without_overwriting_prefix(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.saved_matrix(root)
+            def failed(case, strategy, raw, stop, checkpoint):
+                raw['result'] = {'case': case.name, 'strategy': strategy, 'status': 'recovery_failed',
+                                 'cleanup': {'status': 'failed'}}
+                checkpoint()
+                return raw['result']
+            with patch('device_validation.wait_for_recovery'), patch('device_validation.CancelExperiment'), \
+                 patch('device_validation.run_case', side_effect=failed) as run:
+                result = resume_suite(path, threading.Event())
+            run.assert_called_once()
+            self.assertFalse(result['completed'])
+            self.assertEqual(len(result['cases']), 21)
+            self.assertEqual(len(result['unattempted_cases']), 29)
+            self.assertEqual(len(resume_state(path)[0]['cases']), 21)
+
+    def test_session_resume_updates_public_status_and_passes_resume_flag(self):
+        for completed in (True, False):
+            with self.subTest(completed=completed), tempfile.TemporaryDirectory() as root:
+                session = TestSession(root, 'validation')
+                directory = session.raw_dir / 'validation'
+                directory.mkdir()
+                path = self.saved_matrix(directory)
+                session.summary['status'] = 'failed'
+                session.summary['steps'][0]['status'] = 'failed'
+                session.terminal = True
+                session.save()
+                class Process:
+                    returncode = 0 if completed else 1
+                    def poll(self): return self.returncode
+                def start(args, **kwargs):
+                    self.assertIn('--resume-matrix', args)
+                    report = json.loads(path.read_text())
+                    report['completed'] = completed
+                    path.write_text(json.dumps(report))
+                    return Process()
+                with patch('device_testing.subprocess.Popen', side_effect=start):
+                    session.resume_validation()
+                self.assertEqual(session.summary['completed'], completed)
+                self.assertEqual(session.summary['status'], 'observed' if completed else 'failed')
+                self.assertEqual(session.index, 1 if completed else 0)
+                self.assertEqual(len(list(directory.glob('case-*.json'))), 20)
+                self.assertEqual(list(session.raw_dir.glob('attempt-*')), [])
+
+    def test_resume_rejects_invalidated_or_mismatched_and_orphaned_evidence(self):
+        for mutation in ('invalidated', 'schema', 'order', 'orphan', 'evidence'):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as root:
+                path = self.saved_matrix(root)
+                report = json.loads(path.read_text())
+                if mutation == 'invalidated': report['valid_for_analysis'] = False
+                if mutation == 'schema': report['schema_version'] = 1
+                if mutation == 'order': report['cases'][0]['case'] = 'wrong'
+                if mutation == 'orphan':
+                    case, strategy = CASES[20]
+                    (path.parent / f'case-21-{case.name}-{strategy}.json').write_text('{}')
+                if mutation == 'evidence':
+                    next(path.parent.glob('case-*.json')).write_text('{}')
+                path.write_text(json.dumps(report))
+                with patch('device_validation.CancelExperiment') as factory, self.assertRaises(ValueError):
+                    resume_suite(path, threading.Event())
+                factory.assert_not_called()
+
+    def test_wait_reopens_without_reset_and_closes_failed_checks(self):
+        with tempfile.TemporaryDirectory() as root:
+            stop = threading.Event()
+            first, second = Mock(), Mock()
+            first.probe_bridge.side_effect = ProbeError('not ready')
+            record = {}
+            with patch.object(stop, 'wait', return_value=False) as wait:
+                wait_for_recovery(Path(root), '/physical/port', stop, Mock(), record, Mock(),
+                                  factory=Mock(side_effect=[first, second]))
+            self.assertEqual(wait.call_count, 7)
+            self.assertEqual([c['status'] for c in record['recovery_checks']], ['failed', 'passed'])
+            first.health.assert_not_called()
+            second.health.assert_called_once()
+            for ex in (first, second):
+                ex.reset.assert_not_called()
+                ex.drain.assert_not_called()
+                ex.close.assert_called_once()
+
+    def test_stop_during_wait_never_opens_usb(self):
+        with tempfile.TemporaryDirectory() as root:
+            stop = threading.Event()
+            factory = Mock()
+            with patch.object(stop, 'wait', return_value=True), self.assertRaises(ProbeError):
+                wait_for_recovery(Path(root), '/physical/port', stop, Mock(), {}, Mock(), factory=factory)
+            factory.assert_not_called()
+
+    def test_wait_close_failure_does_not_unlock_or_retry(self):
+        with tempfile.TemporaryDirectory() as root:
+            ex = Mock()
+            ex.close.side_effect = ProbeError('release failure')
+            stop = threading.Event()
+            factory = Mock(return_value=ex)
+            with patch.object(stop, 'wait', return_value=False), self.assertRaises(ProbeError):
+                wait_for_recovery(Path(root), '/physical/port', stop, Mock(), {}, Mock(), factory=factory)
+            factory.assert_called_once()
+
     def test_one_gui_step_contains_whole_matrix(self):
         self.assertEqual(len(plan("validation")), 1)
         self.assertEqual(len(CASES), len(CONTROLS) + len(INTERRUPTIONS) * len(STRATEGIES))
@@ -312,7 +465,9 @@ class ValidationTest(unittest.TestCase):
                   "error": "secret", "injection": {"target_hit": True, "hex": "secret"},
                   "followup": {"frames": 3, "sha256": "secret"},
                   "cleanup": {"status": "failed", "error": "secret"}}],
-                  "sampling": [{"phase": "hold", "frames": 3, "normal_metrics": "secret", "sha256": "secret"}]}
+                  "sampling": [{"phase": "hold", "frames": 3, "normal_metrics": "secret", "sha256": "secret"}],
+                  "continuations": [{"status": "failed", "error": "secret", "recovery_checks": [
+                      {"status": "failed", "wait_s": 2, "response_hex": "secret", "error": "secret"}]}]}
         public = json.dumps(public_summary(report))
         self.assertNotIn("secret", public)
         self.assertNotIn("sha256", public)

@@ -22,6 +22,9 @@ enum {
   IMAGE_DATA_SIZE = 12160,
   COMMAND_TIMEOUT_MS = 1000,
   FRAME_TIMEOUT_MS = 5000,
+  DRAIN_TIMEOUT_MS = 200,
+  DRAIN_BUDGET_MS = 1000,
+  DRAIN_MAX_READS = 4,
   FINGER_POLL_INTERVAL_MS = 50
 };
 
@@ -35,20 +38,31 @@ enum {
   REPLY_DATA_OFFSET = REPLY_STATUS_OFFSET + REPLY_STATUS_SIZE,
   REPLY_BCC_SIZE = 1,
   REPLY_TRAILER_SIZE = 1,
-  STATUS_DATA_SIZE = 1,
-  STATUS_REPLY_MAX_SIZE = REPLY_DATA_OFFSET + STATUS_DATA_SIZE + REPLY_BCC_SIZE + REPLY_TRAILER_SIZE,
+  REPLY_MAX_SIZE = REPLY_DATA_OFFSET + IMAGE_DATA_SIZE + REPLY_BCC_SIZE + REPLY_TRAILER_SIZE,
   NORMAL_STATUS_NOT_READY = 0x00,
   NORMAL_STATUS_READY = 0x01,
   EXTENDED_STATUS_READY = 0x05,
   EXTENDED_STATUS_NOT_READY = 0x06
 };
 
-G_STATIC_ASSERT(FT9362_RAW_FRAME_SIZE == REPLY_DATA_OFFSET + IMAGE_DATA_SIZE + REPLY_BCC_SIZE + REPLY_TRAILER_SIZE);
+/* Wire request, response payload size, deadline, and optional health value. */
+typedef struct {
+  guint8 bytes[7];
+  gsize size;
+  gsize data_size;
+  guint timeout_ms;
+  guint8 expected[2];
+  gboolean check_value;
+} Ft9362Command;
 
-static const guint8 finger_status_command[] = {0x02, 0x00, 0x03, 0x80, 0x02, 0x01, 0x80};
-static const guint8 capture_command[] = {0x02, 0x00, 0x01, 0x81, 0x80};
-static const guint8 extended_status_command[] = {0x02, 0x00, 0x03, 0x82, 0x73, 0x01, 0xf3};
-static const guint8 extended_capture_command[] = {0x02, 0x00, 0x03, 0x82, 0x76, 0x01, 0xf6};
+static const Ft9362Command bridge_command = {{2, 0, 1, 0x34, 0x35}, 5, 2, COMMAND_TIMEOUT_MS, {0x55, 0xaa}, TRUE};
+static const Ft9362Command app_command = {{2, 0, 3, 0x80, 1, 2, 0x80}, 7, 2, COMMAND_TIMEOUT_MS, {0xa5, 0x5a}, TRUE};
+static const Ft9362Command dimension_a_command = {{2, 0, 3, 0x80, 3, 1, 0x81}, 7, 1, COMMAND_TIMEOUT_MS, {0x28}, TRUE};
+static const Ft9362Command dimension_b_command = {{2, 0, 3, 0x80, 4, 1, 0x86}, 7, 1, COMMAND_TIMEOUT_MS, {0x98}, TRUE};
+static const Ft9362Command finger_status_command = {{2, 0, 3, 0x80, 2, 1, 0x80}, 7, 1, COMMAND_TIMEOUT_MS};
+static const Ft9362Command capture_command = {{2, 0, 1, 0x81, 0x80}, 5, IMAGE_DATA_SIZE, FRAME_TIMEOUT_MS};
+static const Ft9362Command extended_status_command = {{2, 0, 3, 0x82, 0x73, 1, 0xf3}, 7, 1, COMMAND_TIMEOUT_MS};
+static const Ft9362Command extended_capture_command = {{2, 0, 3, 0x82, 0x76, 1, 0xf6}, 7, IMAGE_DATA_SIZE, FRAME_TIMEOUT_MS};
 
 static const FpIdEntry supported_devices[] = {
     {.vid = USB_VENDOR_ID, .pid = USB_PRODUCT_ID},
@@ -56,29 +70,41 @@ static const FpIdEntry supported_devices[] = {
 };
 
 typedef enum {
-  CAPTURE_SEND_POLL,
-  CAPTURE_READ_STATUS,
-  CAPTURE_SEND_EXTENDED_POLL,
-  CAPTURE_READ_EXTENDED_STATUS,
-  CAPTURE_SEND_EXTENDED_COMMAND,
-  CAPTURE_READ_EXTENDED_FRAME,
+  CAPTURE_SYNC_DRAIN,
+  CAPTURE_SYNC_BRIDGE,
+  CAPTURE_SYNC_APP,
+  CAPTURE_SYNC_A,
+  CAPTURE_SYNC_B,
+  CAPTURE_CONTACT,
+  CAPTURE_POLL,
+  CAPTURE_REFRESH,
+  CAPTURE_POLL_REFRESHED,
+  CAPTURE_FRAME,
   CAPTURE_WAIT_POLL,
-  CAPTURE_SEND_COMMAND,
-  CAPTURE_READ_FRAME,
   CAPTURE_NUM_STATES
 } Ft9362CapturePhase;
 
 typedef struct {
-  guint8 frame[FT9362_RAW_FRAME_SIZE];
+  const Ft9362Command* command;
+  guint8 reply[REPLY_MAX_SIZE];
   gsize bytes_received;
   gint64 reply_deadline_us;
-  FpiSsm* machine;
+  gboolean active;
   gboolean transfer_pending;
+} Ft9362Transaction;
+
+typedef struct {
+  FpiSsm* machine;
+  gint64 drain_deadline_us;
+  guint drain_reads;
 } Ft9362CaptureState;
 
 struct _FpiDeviceFocaltech0752 {
   FpDevice parent_instance;
   Ft9362CaptureState capture;
+  Ft9362Transaction transaction;
+  /* Survives action cleanup: clearing host memory does not drain the device. */
+  gboolean needs_sync;
 };
 
 G_DECLARE_FINAL_TYPE(FpiDeviceFocaltech0752, fpi_device_focaltech0752, FPI, DEVICE_FOCALTECH0752, FpDevice);
@@ -87,15 +113,14 @@ G_DEFINE_TYPE(FpiDeviceFocaltech0752, fpi_device_focaltech0752, FP_TYPE_DEVICE);
 static void on_command_written(FpiUsbTransfer* transfer, FpDevice* dev, gpointer user_data, GError* error);
 static void on_reply_received(FpiUsbTransfer* transfer, FpDevice* dev, gpointer user_data, GError* error);
 
-static void capture_reset(FpDevice* dev) {
-  Ft9362CaptureState* capture = &FPI_DEVICE_FOCALTECH0752(dev)->capture;
-  memset(capture->frame, 0, sizeof(capture->frame));
-  capture->bytes_received = 0;
-  capture->reply_deadline_us = 0;
+static void transaction_clear(FpDevice* dev) {
+  Ft9362Transaction* transaction = &FPI_DEVICE_FOCALTECH0752(dev)->transaction;
+  g_assert(!transaction->active && !transaction->transfer_pending);
+  memset(transaction, 0, sizeof(*transaction));
 }
 
 static void capture_cleanup(FpDevice* dev) {
-  capture_reset(dev);
+  transaction_clear(dev);
   fpi_device_report_finger_status(dev, FP_FINGER_STATUS_NONE);
 }
 
@@ -106,7 +131,7 @@ static void capture_fail(FpDevice* dev, GError* error) {
 
 static gboolean capture_cancel_if_ready(FpDevice* dev) {
   Ft9362CaptureState* capture = &FPI_DEVICE_FOCALTECH0752(dev)->capture;
-  if (capture->machine == NULL || capture->transfer_pending || !fpi_device_action_is_cancelled(dev)) {
+  if (capture->machine == NULL || FPI_DEVICE_FOCALTECH0752(dev)->transaction.active || !fpi_device_action_is_cancelled(dev)) {
     return FALSE;
   }
 
@@ -257,8 +282,14 @@ static void process_identification(FpDevice* dev, const Ft9362Frame* frame) {
 }
 
 static void capture_process_frame(FpDevice* dev) {
-  Ft9362CaptureState* capture = &FPI_DEVICE_FOCALTECH0752(dev)->capture;
-  Ft9362Frame frame = {capture->frame, capture->bytes_received};
+  Ft9362Transaction* transaction = &FPI_DEVICE_FOCALTECH0752(dev)->transaction;
+  /* The wire transaction has already completed. Representation/backend errors
+   * must not change device synchronization or cause a drain on the next action. */
+  if (transaction->bytes_received != FT9362_RAW_FRAME_SIZE) {
+    capture_fail(dev, fpi_device_error_new_msg(FP_DEVICE_ERROR_NOT_SUPPORTED, "Image response is incompatible with FT9362-RAW-v1"));
+    return;
+  }
+  Ft9362Frame frame = {transaction->reply, transaction->bytes_received};
   FpiDeviceAction action = fpi_device_get_current_action(dev);
   if (action == FPI_DEVICE_ACTION_ENROLL) {
     process_enrollment(dev, &frame);
@@ -271,98 +302,73 @@ static void capture_process_frame(FpDevice* dev) {
   }
 }
 
-static void usb_submit(FpiUsbTransfer* transfer, guint timeout_ms, FpiUsbTransferCallback callback) {
-  FpDevice* dev = transfer->device;
-  Ft9362CaptureState* capture = &FPI_DEVICE_FOCALTECH0752(dev)->capture;
-  transfer->ssm = capture->machine;
-  capture->transfer_pending = TRUE;
-  fpi_usb_transfer_submit(transfer, timeout_ms, fpi_device_get_cancellable(dev), callback, NULL);
+/* Transport owns OUT + the entire reply, independently of action cancellation. */
+static void transaction_fail(FpDevice* dev, GError* error) {
+  FpiDeviceFocaltech0752* self = FPI_DEVICE_FOCALTECH0752(dev);
+  self->needs_sync = TRUE;
+  self->transaction.active = FALSE;
+  if (capture_cancel_if_ready(dev)) {
+    g_error_free(error);
+    return;
+  }
+  fpi_ssm_mark_failed(self->capture.machine, error);
 }
 
-static void usb_write_command(FpDevice* dev, const guint8* command, gsize size, FpiUsbTransferCallback callback) {
-  FpiUsbTransfer* transfer = fpi_usb_transfer_new(dev);
-  fpi_usb_transfer_fill_bulk_full(transfer, USB_ENDPOINT_OUT, (guint8*)command, size, NULL);
-  transfer->short_is_error = TRUE;
-  usb_submit(transfer, COMMAND_TIMEOUT_MS, callback);
+static void usb_submit(FpiUsbTransfer* transfer, guint timeout_ms, FpiUsbTransferCallback callback) {
+  FpiDeviceFocaltech0752* self = FPI_DEVICE_FOCALTECH0752(transfer->device);
+  g_assert(!self->transaction.transfer_pending);
+  transfer->ssm = self->capture.machine;
+  self->transaction.transfer_pending = TRUE;
+  fpi_usb_transfer_submit(transfer, timeout_ms, NULL, callback, NULL);
 }
 
 static void usb_read_reply(FpDevice* dev) {
-  Ft9362CaptureState* capture = &FPI_DEVICE_FOCALTECH0752(dev)->capture;
-  Ft9362CapturePhase phase = fpi_ssm_get_cur_state(capture->machine);
-  gboolean image = phase == CAPTURE_READ_FRAME || phase == CAPTURE_READ_EXTENDED_FRAME;
-  gsize maximum = image ? FT9362_RAW_FRAME_SIZE : STATUS_REPLY_MAX_SIZE;
-  gint64 remaining_us = capture->reply_deadline_us - g_get_monotonic_time();
+  Ft9362Transaction* transaction = &FPI_DEVICE_FOCALTECH0752(dev)->transaction;
+  gint64 remaining_us = transaction->reply_deadline_us - g_get_monotonic_time();
   if (remaining_us <= 0) {
-    fpi_ssm_mark_failed(capture->machine, g_error_new_literal(G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT, "USB response deadline expired"));
+    transaction_fail(dev, g_error_new_literal(G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT, "USB response deadline expired"));
     return;
   }
 
-  gsize capacity = ((maximum - capture->bytes_received + USB_PACKET_SIZE - 1) / USB_PACKET_SIZE) * USB_PACKET_SIZE;
+  /* Even a status request may encounter a stale image. Never truncate it to 64 bytes. */
+  gsize capacity = ((sizeof(transaction->reply) - transaction->bytes_received + USB_PACKET_SIZE - 1) / USB_PACKET_SIZE) * USB_PACKET_SIZE;
   FpiUsbTransfer* transfer = fpi_usb_transfer_new(dev);
   fpi_usb_transfer_fill_bulk(transfer, USB_ENDPOINT_IN, capacity);
   usb_submit(transfer, (remaining_us + G_TIME_SPAN_MILLISECOND - 1) / G_TIME_SPAN_MILLISECOND, on_reply_received);
 }
 
-static gboolean capture_handle_transfer_result(FpiUsbTransfer* transfer, GError* error) {
+static void transaction_start(FpDevice* dev, const Ft9362Command* command) {
+  Ft9362Transaction* transaction = &FPI_DEVICE_FOCALTECH0752(dev)->transaction;
+  transaction_clear(dev);
+  transaction->command = command;
+  transaction->active = TRUE;
+  FpiUsbTransfer* transfer = fpi_usb_transfer_new(dev);
+  fpi_usb_transfer_fill_bulk_full(transfer, USB_ENDPOINT_OUT, (guint8*)command->bytes, command->size, NULL);
+  transfer->short_is_error = TRUE;
+  usb_submit(transfer, COMMAND_TIMEOUT_MS, on_command_written);
+}
+
+static gboolean transaction_transfer_finished(FpiUsbTransfer* transfer, GError* error) {
   FpDevice* dev = transfer->device;
-  FPI_DEVICE_FOCALTECH0752(dev)->capture.transfer_pending = FALSE;
-  if (capture_cancel_if_ready(dev)) {
-    g_clear_error(&error);
-    return FALSE;
-  }
+  FPI_DEVICE_FOCALTECH0752(dev)->transaction.transfer_pending = FALSE;
   if (error != NULL) {
-    fpi_ssm_mark_failed(transfer->ssm, error);
+    transaction_fail(dev, error);
     return FALSE;
   }
   if (transfer->endpoint == USB_ENDPOINT_OUT && transfer->actual_length != transfer->length) {
-    fpi_ssm_mark_failed(transfer->ssm, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Incomplete USB command write"));
+    transaction_fail(dev, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Incomplete USB command write"));
     return FALSE;
   }
   return TRUE;
 }
 
-static void capture_run_state(FpiSsm* machine, FpDevice* dev) {
-  if (capture_cancel_if_ready(dev)) {
-    return;
-  }
-  switch ((Ft9362CapturePhase)fpi_ssm_get_cur_state(machine)) {
-    case CAPTURE_SEND_POLL:
-      usb_write_command(dev, finger_status_command, sizeof(finger_status_command), on_command_written);
-      break;
-    case CAPTURE_READ_STATUS:
-    case CAPTURE_READ_EXTENDED_STATUS:
-    case CAPTURE_READ_EXTENDED_FRAME:
-    case CAPTURE_READ_FRAME:
-      usb_read_reply(dev);
-      break;
-    case CAPTURE_SEND_EXTENDED_POLL:
-      usb_write_command(dev, extended_status_command, sizeof(extended_status_command), on_command_written);
-      break;
-    case CAPTURE_SEND_EXTENDED_COMMAND:
-      usb_write_command(dev, extended_capture_command, sizeof(extended_capture_command), on_command_written);
-      break;
-    case CAPTURE_WAIT_POLL:
-      fpi_ssm_jump_to_state_delayed(machine, CAPTURE_SEND_POLL, FINGER_POLL_INTERVAL_MS);
-      break;
-    case CAPTURE_SEND_COMMAND:
-      usb_write_command(dev, capture_command, sizeof(capture_command), on_command_written);
-      break;
-    case CAPTURE_NUM_STATES:
-    default:
-      g_assert_not_reached();
-  }
-}
-
 static void on_command_written(FpiUsbTransfer* transfer, FpDevice* dev, gpointer user_data, GError* error) {
-  if (!capture_handle_transfer_result(transfer, error)) {
+  if (!transaction_transfer_finished(transfer, error)) {
     return;
   }
-  Ft9362CaptureState* capture = &FPI_DEVICE_FOCALTECH0752(dev)->capture;
-  Ft9362CapturePhase phase = fpi_ssm_get_cur_state(transfer->ssm);
-  gboolean image = phase == CAPTURE_SEND_COMMAND || phase == CAPTURE_SEND_EXTENDED_COMMAND;
-  capture_reset(dev);
-  capture->reply_deadline_us = g_get_monotonic_time() + (image ? FRAME_TIMEOUT_MS : COMMAND_TIMEOUT_MS) * G_TIME_SPAN_MILLISECOND;
-  fpi_ssm_next_state(transfer->ssm);
+  Ft9362Transaction* transaction = &FPI_DEVICE_FOCALTECH0752(dev)->transaction;
+  transaction->reply_deadline_us = g_get_monotonic_time() + transaction->command->timeout_ms * G_TIME_SPAN_MILLISECOND;
+  usb_read_reply(dev);
 }
 
 static GError* reply_validate(const guint8* reply, gsize size, gsize data_size) {
@@ -387,65 +393,181 @@ static GError* reply_validate(const guint8* reply, gsize size, gsize data_size) 
   return NULL;
 }
 
+/* Acquisition sees only validated, complete transactions. */
+static void capture_transaction_done(FpDevice* dev) {
+  FpiDeviceFocaltech0752* self = FPI_DEVICE_FOCALTECH0752(dev);
+  FpiSsm* machine = self->capture.machine;
+  Ft9362CapturePhase phase = fpi_ssm_get_cur_state(machine);
+  guint8 value = self->transaction.reply[REPLY_DATA_OFFSET];
+  /* Validate semantic state even when cancellation races the final callback. */
+  if ((phase == CAPTURE_CONTACT && value != EXTENDED_STATUS_READY && value != EXTENDED_STATUS_NOT_READY) || ((phase == CAPTURE_POLL || phase == CAPTURE_POLL_REFRESHED) && value != NORMAL_STATUS_READY && value != NORMAL_STATUS_NOT_READY)) {
+    transaction_fail(dev, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Unknown capture status 0x%02x in phase %d", value, phase));
+    return;
+  }
+  if (capture_cancel_if_ready(dev)) {
+    return;
+  }
+  switch (phase) {
+    case CAPTURE_SYNC_BRIDGE:
+    case CAPTURE_SYNC_APP:
+    case CAPTURE_SYNC_A:
+    case CAPTURE_SYNC_B:
+      fpi_ssm_next_state(machine);
+      break;
+    case CAPTURE_CONTACT:
+      self->needs_sync = FALSE;
+      fpi_device_report_finger_status(dev, value == EXTENDED_STATUS_READY ? FP_FINGER_STATUS_PRESENT : FP_FINGER_STATUS_NEEDED);
+      fpi_ssm_jump_to_state(machine, value == EXTENDED_STATUS_READY ? CAPTURE_POLL : CAPTURE_WAIT_POLL);
+      break;
+    case CAPTURE_POLL:
+    case CAPTURE_POLL_REFRESHED:
+      if (value == NORMAL_STATUS_READY) {
+        fpi_ssm_jump_to_state(machine, CAPTURE_FRAME);
+      } else {
+        fpi_ssm_jump_to_state(machine, phase == CAPTURE_POLL ? CAPTURE_REFRESH : CAPTURE_WAIT_POLL);
+      }
+      break;
+    case CAPTURE_REFRESH:
+      fpi_ssm_next_state(machine);
+      break;
+    case CAPTURE_FRAME:
+      fpi_ssm_mark_completed(machine);
+      break;
+    case CAPTURE_SYNC_DRAIN:
+    case CAPTURE_WAIT_POLL:
+    case CAPTURE_NUM_STATES:
+    default:
+      g_assert_not_reached();
+  }
+}
+
 static void on_reply_received(FpiUsbTransfer* transfer, FpDevice* dev, gpointer user_data, GError* error) {
-  Ft9362CaptureState* capture = &FPI_DEVICE_FOCALTECH0752(dev)->capture;
-  if (!capture_handle_transfer_result(transfer, error)) {
+  Ft9362Transaction* transaction = &FPI_DEVICE_FOCALTECH0752(dev)->transaction;
+  if (!transaction_transfer_finished(transfer, error)) {
     return;
   }
-
-  Ft9362CapturePhase phase = fpi_ssm_get_cur_state(transfer->ssm);
-  gboolean image = phase == CAPTURE_READ_FRAME || phase == CAPTURE_READ_EXTENDED_FRAME;
-  gsize data_size = image ? IMAGE_DATA_SIZE : STATUS_DATA_SIZE;
-  gsize maximum = REPLY_DATA_OFFSET + data_size + REPLY_BCC_SIZE + REPLY_TRAILER_SIZE;
-  if (transfer->actual_length <= 0 || transfer->actual_length > transfer->length || (gsize)transfer->actual_length > maximum - capture->bytes_received) {
-    fpi_ssm_mark_failed(transfer->ssm, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Invalid USB response chunk length"));
+  if (transfer->actual_length <= 0 || transfer->actual_length > transfer->length || (gsize)transfer->actual_length > sizeof(transaction->reply) - transaction->bytes_received) {
+    transaction_fail(dev, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Invalid USB response chunk length"));
     return;
   }
-  memcpy(capture->frame + capture->bytes_received, transfer->buffer, transfer->actual_length);
-  capture->bytes_received += transfer->actual_length;
-  if (capture->frame[0] != REPLY_START_BYTE) {
-    fpi_ssm_mark_failed(transfer->ssm, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Invalid USB response header"));
+  memcpy(transaction->reply + transaction->bytes_received, transfer->buffer, transfer->actual_length);
+  transaction->bytes_received += transfer->actual_length;
+  if (transaction->reply[0] != REPLY_START_BYTE) {
+    transaction_fail(dev, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Invalid USB response header"));
     return;
   }
-  if (capture->bytes_received < REPLY_HEADER_SIZE) {
+  if (transaction->bytes_received < REPLY_HEADER_SIZE) {
     usb_read_reply(dev);
     return;
   }
-
-  gsize content_size = ((gsize)capture->frame[REPLY_LENGTH_OFFSET] << 8) | capture->frame[REPLY_LENGTH_OFFSET + 1];
-  if (content_size < REPLY_STATUS_SIZE || content_size > data_size + REPLY_STATUS_SIZE) {
-    fpi_ssm_mark_failed(transfer->ssm, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Invalid USB response content length: %zu", content_size));
+  gsize content_size = ((gsize)transaction->reply[REPLY_LENGTH_OFFSET] << 8) | transaction->reply[REPLY_LENGTH_OFFSET + 1];
+  if (content_size < REPLY_STATUS_SIZE || content_size > IMAGE_DATA_SIZE + REPLY_STATUS_SIZE) {
+    transaction_fail(dev, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Invalid USB response content length: %zu", content_size));
     return;
   }
-  if (capture->bytes_received < content_size + REPLY_HEADER_SIZE + REPLY_BCC_SIZE) {
+  if (transaction->bytes_received < content_size + REPLY_HEADER_SIZE + REPLY_BCC_SIZE) {
     usb_read_reply(dev);
     return;
   }
-  error = reply_validate(capture->frame, capture->bytes_received, data_size);
+  const Ft9362Command* command = transaction->command;
+  error = reply_validate(transaction->reply, transaction->bytes_received, command->data_size);
+  if (error == NULL && command->check_value && memcmp(transaction->reply + REPLY_DATA_OFFSET, command->expected, command->data_size) != 0) {
+    error = fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Device health response value mismatch");
+  }
   if (error != NULL) {
-    fpi_ssm_mark_failed(transfer->ssm, error);
+    transaction_fail(dev, error);
     return;
   }
+  transaction->active = FALSE;
+  capture_transaction_done(dev);
+}
 
-  if (phase == CAPTURE_READ_FRAME) {
-    if (capture->bytes_received != FT9362_RAW_FRAME_SIZE) {
-      fpi_ssm_mark_failed(transfer->ssm, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Image response is incompatible with FT9362-RAW-v1"));
-      return;
-    }
-    fpi_ssm_mark_completed(transfer->ssm);
-  } else if (phase == CAPTURE_READ_EXTENDED_FRAME) {
-    fpi_ssm_jump_to_state(transfer->ssm, CAPTURE_SEND_POLL);
-  } else if (phase == CAPTURE_READ_STATUS && capture->frame[REPLY_DATA_OFFSET] == NORMAL_STATUS_READY) {
-    fpi_device_report_finger_status(dev, FP_FINGER_STATUS_PRESENT);
-    fpi_ssm_jump_to_state(transfer->ssm, CAPTURE_SEND_COMMAND);
-  } else if (phase == CAPTURE_READ_STATUS && capture->frame[REPLY_DATA_OFFSET] == NORMAL_STATUS_NOT_READY) {
-    fpi_ssm_jump_to_state(transfer->ssm, CAPTURE_SEND_EXTENDED_POLL);
-  } else if (phase == CAPTURE_READ_EXTENDED_STATUS && capture->frame[REPLY_DATA_OFFSET] == EXTENDED_STATUS_READY) {
-    fpi_ssm_jump_to_state(transfer->ssm, CAPTURE_SEND_EXTENDED_COMMAND);
-  } else if (phase == CAPTURE_READ_EXTENDED_STATUS && capture->frame[REPLY_DATA_OFFSET] == EXTENDED_STATUS_NOT_READY) {
-    fpi_ssm_jump_to_state(transfer->ssm, CAPTURE_WAIT_POLL);
+static void sync_drain(FpDevice* dev);
+
+static void on_drain_received(FpiUsbTransfer* transfer, FpDevice* dev, gpointer user_data, GError* error) {
+  FpiDeviceFocaltech0752* self = FPI_DEVICE_FOCALTECH0752(dev);
+  self->transaction.transfer_pending = FALSE;
+  self->transaction.active = FALSE;
+  /* GUsb returns -1 on timeout and hides libusb's partial length. This is
+   * only the end of the drain window, not proof of an empty device queue.
+   * The following full-capacity health transactions must still succeed. */
+  gboolean timed_out = g_error_matches(error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT);
+  if (capture_cancel_if_ready(dev)) {
+    g_clear_error(&error);
+    return;
+  }
+  if (timed_out) {
+    g_clear_error(&error);
+    fpi_ssm_next_state(self->capture.machine);
+  } else if (error != NULL) {
+    transaction_fail(dev, error);
+  } else if (transfer->actual_length <= 0 || transfer->actual_length > transfer->length) {
+    transaction_fail(dev, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Invalid drain response length"));
   } else {
-    fpi_ssm_mark_failed(transfer->ssm, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Unexpected capture status 0x%02x in phase %d", capture->frame[REPLY_DATA_OFFSET], phase));
+    sync_drain(dev);
+  }
+}
+
+static void sync_drain(FpDevice* dev) {
+  FpiDeviceFocaltech0752* self = FPI_DEVICE_FOCALTECH0752(dev);
+  gint64 remaining_us = self->capture.drain_deadline_us - g_get_monotonic_time();
+  if (self->capture.drain_reads >= DRAIN_MAX_READS || remaining_us <= 0) {
+    transaction_fail(dev, fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "USB input did not become quiet within the drain budget"));
+    return;
+  }
+  self->capture.drain_reads++;
+  self->transaction.active = TRUE;
+  FpiUsbTransfer* transfer = fpi_usb_transfer_new(dev);
+  fpi_usb_transfer_fill_bulk(transfer, USB_ENDPOINT_IN, ((REPLY_MAX_SIZE + USB_PACKET_SIZE - 1) / USB_PACKET_SIZE) * USB_PACKET_SIZE);
+  usb_submit(transfer, MIN(DRAIN_TIMEOUT_MS, (remaining_us + G_TIME_SPAN_MILLISECOND - 1) / G_TIME_SPAN_MILLISECOND), on_drain_received);
+}
+
+static void capture_run_state(FpiSsm* machine, FpDevice* dev) {
+  FpiDeviceFocaltech0752* self = FPI_DEVICE_FOCALTECH0752(dev);
+  if (capture_cancel_if_ready(dev)) {
+    return;
+  }
+  switch ((Ft9362CapturePhase)fpi_ssm_get_cur_state(machine)) {
+    case CAPTURE_SYNC_DRAIN:
+      if (!self->needs_sync) {
+        fpi_ssm_jump_to_state(machine, CAPTURE_CONTACT);
+        break;
+      }
+      self->capture.drain_reads = 0;
+      self->capture.drain_deadline_us = g_get_monotonic_time() + DRAIN_BUDGET_MS * G_TIME_SPAN_MILLISECOND;
+      sync_drain(dev);
+      break;
+    case CAPTURE_SYNC_BRIDGE:
+      transaction_start(dev, &bridge_command);
+      break;
+    case CAPTURE_SYNC_APP:
+      transaction_start(dev, &app_command);
+      break;
+    case CAPTURE_SYNC_A:
+      transaction_start(dev, &dimension_a_command);
+      break;
+    case CAPTURE_SYNC_B:
+      transaction_start(dev, &dimension_b_command);
+      break;
+    case CAPTURE_CONTACT:
+      transaction_start(dev, &extended_status_command);
+      break;
+    case CAPTURE_POLL:
+    case CAPTURE_POLL_REFRESHED:
+      transaction_start(dev, &finger_status_command);
+      break;
+    case CAPTURE_REFRESH:
+      transaction_start(dev, &extended_capture_command);
+      break;
+    case CAPTURE_FRAME:
+      transaction_start(dev, &capture_command);
+      break;
+    case CAPTURE_WAIT_POLL:
+      fpi_ssm_jump_to_state_delayed(machine, CAPTURE_CONTACT, FINGER_POLL_INTERVAL_MS);
+      break;
+    case CAPTURE_NUM_STATES:
+    default:
+      g_assert_not_reached();
   }
 }
 
@@ -459,6 +581,7 @@ static void capture_done(FpiSsm* machine, FpDevice* dev, GError* error) {
 }
 
 static void device_open(FpDevice* dev) {
+  FPI_DEVICE_FOCALTECH0752(dev)->needs_sync = TRUE;
   GError* error = NULL;
   GUsbDevice* usb = fpi_device_get_usb_device(dev);
   if (!g_usb_device_claim_interface(usb, USB_INTERFACE, 0, &error)) {
@@ -471,7 +594,7 @@ static void device_open(FpDevice* dev) {
 static void device_close(FpDevice* dev) {
   GError* error = NULL;
   GUsbDevice* usb = fpi_device_get_usb_device(dev);
-  capture_reset(dev);
+  transaction_clear(dev);
   if (!g_usb_device_release_interface(usb, USB_INTERFACE, 0, &error)) {
     fpi_device_close_complete(dev, error);
     return;
@@ -481,7 +604,7 @@ static void device_close(FpDevice* dev) {
 
 static void device_start_capture(FpDevice* dev) {
   Ft9362CaptureState* capture = &FPI_DEVICE_FOCALTECH0752(dev)->capture;
-  capture_reset(dev);
+  transaction_clear(dev);
   fpi_device_report_finger_status(dev, FP_FINGER_STATUS_NEEDED);
   capture->machine = fpi_ssm_new(dev, capture_run_state, CAPTURE_NUM_STATES);
   fpi_ssm_start(capture->machine, capture_done);
@@ -489,14 +612,14 @@ static void device_start_capture(FpDevice* dev) {
 
 static void device_cancel(FpDevice* dev) {
   Ft9362CaptureState* capture = &FPI_DEVICE_FOCALTECH0752(dev)->capture;
-  if (capture->machine != NULL && !capture->transfer_pending && fpi_ssm_get_cur_state(capture->machine) == CAPTURE_WAIT_POLL) {
+  if (capture->machine != NULL && !FPI_DEVICE_FOCALTECH0752(dev)->transaction.active && fpi_ssm_get_cur_state(capture->machine) == CAPTURE_WAIT_POLL) {
     fpi_ssm_cancel_delayed_state_change(capture->machine);
   }
   capture_cancel_if_ready(dev);
 }
 
 static void device_finalize(GObject* object) {
-  capture_reset(FP_DEVICE(object));
+  transaction_clear(FP_DEVICE(object));
   G_OBJECT_CLASS(fpi_device_focaltech0752_parent_class)->finalize(object);
 }
 
