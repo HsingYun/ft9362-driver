@@ -34,7 +34,7 @@ python tools/capture.py --preview /path/to/frame.bin
 
 | 路径 | 内容 |
 | --- | --- |
-| [driver/](driver/) | libfprint C 驱动与不依赖 GLib 的 C++ 后端 |
+| [driver/](driver/) | libfprint C 驱动与不引入第三方库的独立 C++ 算法后端 |
 | [tools/](tools/) | 统一 GUI / CLI 入口及内部模块 |
 | [tests/](tests/) | 驱动、C ABI 和 Python 回归测试 |
 | [docs/](docs/) | 使用、开发、协议及 Windows 移植参考 |
@@ -45,6 +45,7 @@ python tools/capture.py --preview /path/to/frame.bin
 
 - [使用指南](docs/usage.md)：运行、录制、导出与故障排查。
 - [开发指南](docs/development.md)：构建测试、状态机、内存所有权与 C++ 接口契约。
+- [算法设计](docs/matching-design.md)：录入、匹配、模板、CNN／BRISK 候选设计与验收；开放算法选型，最终方案由设备样本评估确定。
 - [协议与数据格式](docs/protocol.md)：命令、原始帧、历史样本证据及未知项。
 - [Windows 移植参考](docs/windows-reference.md)：按型号与分支核对的行为差异、命令和移植依据。
 

@@ -34,7 +34,7 @@ Offline preview with synthetic stripes; no real fingerprint data is shown.
 
 | Path | Contents |
 | --- | --- |
-| [driver/](driver/) | libfprint C driver and a C++ backend with no GLib dependency |
+| [driver/](driver/) | libfprint C driver and an independent C++ algorithm backend without third-party libraries |
 | [tools/](tools/) | Shared GUI / CLI entry point and internal modules |
 | [tests/](tests/) | Driver, C ABI, and Python regression tests |
 | [docs/](docs/) | Usage, development, protocol, and Windows porting documentation |
@@ -47,6 +47,7 @@ The detailed guides are currently in Chinese:
 
 - [Usage guide](docs/usage.md): running the tools, recording, exporting, and troubleshooting.
 - [Development guide](docs/development.md): builds, tests, the state machine, memory ownership, and the C++ interface contract.
+- [Algorithm design](docs/matching-design.md): enrollment, matching, templates, CNN/BRISK candidate designs, and acceptance criteria; algorithm selection remains open and depends on sensor data evaluation.
 - [Protocol and data format](docs/protocol.md): commands, raw frames, historical sample evidence, and unresolved questions.
 - [Windows porting reference](docs/windows-reference.md): behavior differences, commands, and evidence checked against device models and runtime branches.
 
